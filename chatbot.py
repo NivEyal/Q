@@ -508,6 +508,19 @@ def display_stock_data_dashboard(data, risk_score_value=None, risk_category_str=
     st.caption(f"*Data: Yahoo Finance (via yfinance), Polygon.io (for TA signals), News (NewsAPI, FMP, RSS - {NEWS_DAYS_BACK}d / VADER), Wikipedia, Model Calculations, ETS Forecast. May be delayed. Not financial advice.*")
 
 
+
+@st.cache_data(ttl=300)
+def safe_yf_info(ticker):
+    try:
+        ticker_obj = yf.Ticker(ticker)
+        info = ticker_obj.info
+        if not info or 'symbol' not in info:
+            return None
+        return info
+    except Exception as e:
+        logging.warning(f"YF info fetch failed for {ticker}: {e}")
+        return None
+
 @st.cache_data(ttl=HISTORY_CACHE_DURATION_SECONDS)
 def get_unified_yfinance_history(ticker: str, period="3y"):
     """
