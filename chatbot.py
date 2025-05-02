@@ -1957,16 +1957,68 @@ with st.sidebar:
         "💼 Portfolio": ["How to diversify?", "Risks of single stocks?"],
         "📰 Market/General": ["Impact of interest rates?", "Inflation effect?", "What are ETFs?"],
     }
+    # ... (previous code before the sidebar section) ...
+
+# --- UI Elements ---
+# Updated Title
+st.markdown('<h1 style="text-align: left;">📈 Financial Chat, Risk Score, News & Forecasting</h1>', unsafe_allow_html=True)
+# Updated description
+st.markdown(f'<p style="text-align: left; font-size: small;"><br>Ask about stocks ($AAPL, Microsoft), compare, or discuss finance. Includes Dynamic Risk Score, Recent News Sentiment (Multi-Source/{NEWS_DAYS_BACK}d/VADER), and ETS Price Forecasting (Calculated). No charts or technical scans.</p>', unsafe_allow_html=True)
+
+with st.sidebar:
+    st.image("https://streamlit.io/images/brand/streamlit-mark-color.png", width=50)
+    st.markdown("## Examples")
+    # Updated MENU_OPTIONS - removed Scan Signals
+    MENU_OPTIONS = {
+        "🔍 Stock Info": ["What's up with $TSLA?", "$KO", "$TEVA", "MSFT data?", "3M Company info?"],
+        "📊 TA Concepts": ["What is SMA?", "Explain Moving Averages?", "What is Support/Resistance?", "Candlesticks?", "What are technical indicators?"], # Kept TA concepts
+        "⚖️ Risk": [" $AMD?", "Explain the risk score model", " $TQQQ?", " GOOG?"],
+        "📰 News Sentiment": ["News for $MSFT?", " News for $NVDA?", "News for for META?"],
+        "📈 ETS Forecast": ["Forecast $AAPL price", "What's the ETS forecast for $MSFT?", "Price projection for $GOOG?"],
+        "💼 Portfolio": ["How to diversify?", "Risks of single stocks?"],
+        "📰 Market/General": ["Impact of interest rates?", "Inflation effect?", "What are ETFs?"],
+    }
+
+    # --- ADD THIS LINE ---
+    button_counter = 0
+    # --- End Add ---
+
     for category, questions in MENU_OPTIONS.items():
         # Expanded default categories adjusted
         is_expanded = (category in ["🔍 Stock Info", "⚖️ Risk", "📰 News Sentiment", "📈 ETS Forecast"])
         with st.expander(f"**{category}**", expanded=is_expanded):
             for i, q in enumerate(questions):
+                # REMOVE or COMMENT OUT THIS OLD LINE:
                 # safe_category = re.sub(r'\W+', '', category); button_key = f"menu_{safe_category}_{i}"
-                if st.button(q, key=button_key, use_container_width=True): st.session_state.predefined_question = q; st.rerun() # Use st.rerun()
 
-                st.caption("Click a question to ask."); st.divider(); st.info("Enter a ticker symbol ($GOOGL) or company name (Microsoft, 3M) for specific data."); st.divider()
+                # --- ADD THESE TWO LINES ---
+                button_counter += 1
+                button_key = f"menu_example_question_button_{button_counter}" # Assign the key using the counter
+                # --- End Add ---
 
+                # The check below is now less necessary as the counter guarantees uniqueness
+                # if button_key in st.session_state:
+                #     logging.error(f"FATAL: Duplicate button key '{button_key}' detected!")
+
+                if st.button(q, key=button_key, use_container_width=True):
+                    st.session_state.predefined_question = q
+                    st.rerun()
+
+            # --- REMOVE the following three lines from HERE ---
+            # st.caption("Click a question to ask.");
+            # st.divider();
+            # st.info("Enter a ticker symbol ($GOOGL) or company name (Microsoft, 3M) for specific data.");
+            # st.divider() # This last divider was outside the loop originally, move it too.
+            # --- End REMOVE ---
+
+    # --- ADD the lines here, after the loops ---
+    st.caption("Click a question to ask.")
+    st.divider()
+    st.info("Enter a ticker symbol ($GOOGL) or company name (Microsoft, 3M) for specific data.")
+    st.divider() # This divider should also be here
+    # --- End Add ---
+
+# ... (rest of the code, including the rest of the sidebar) ...
     # Display API Key warnings in sidebar
     if not RISKFOLIO_AVAILABLE: st.warning("Riskfolio-Lib not found. Some advanced risk factors/methods disabled.", icon="⚠️")
     # API key checks are done at the start, assuming they stop the app if critical keys are missing/invalid.
