@@ -1,7 +1,8 @@
 # chatbot_optimized.py
-# Financial Chatbot - Optimized with Riskfolio-Lib, Risk Score, Multi-Source News Sentiment + ETS Forecasting
+# Financial Chatbot - Optimized with SIMPLE Risk Score, Multi-Source News Sentiment + ETS Forecasting
 # (Removed pandas-ta dependency and Technical Strategy Scanning)
 # (Now uses Polygon.io data for manual momentum indicator calculations and trading signals)
+# (Simplified Risk Score calculation - removed dependency on Riskfolio-Lib, reduced factors)
 
 
 # WARNING: Hardcoding API keys directly in the script is a SIGNIFICANT SECURITY RISK.
@@ -23,17 +24,18 @@ from collections import Counter
 import sys
 import warnings
 
+import openai  # ✅ MAKE SURE THIS LINE IS PRESENT!
 
 # --- Data Science & Math ---
 import pandas as pd
 import numpy as np
-from scipy.special import binom
+# Removed scipy.special.binom as it's not used in the simplified score
 import statsmodels.api as sm
 from statsmodels.tsa.holtwinters import ExponentialSmoothing # For ETS
-import scipy.stats as stats
-import sklearn.covariance as skcov
+# Removed scipy.stats as it's not used in the simplified score
+# Removed sklearn.covariance as it's not used in the simplified score
 from sklearn.metrics import mean_squared_error # For ETS evaluation
-from numpy.linalg import inv
+# Removed numpy.linalg.inv as it's not used in the simplified score
 
 # --- Financial Data APIs ---
 import yfinance as yf
@@ -44,7 +46,13 @@ import yfinance as yf
 # --- AI & Streamlit ---
 import streamlit as st
 from openai import OpenAI, OpenAIError, AuthenticationError # Explicitly import AuthenticationError
-
+import requests
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import re
+import logging
+import os
+from datetime import datetime, timedelta
+from typing import Dict, Optional, Tuple, Union
 # --- NEWS SENTIMENT LIBS ---
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 import feedparser # For RSS feeds
@@ -62,24 +70,37 @@ warnings.filterwarnings("ignore", message="Non-stationary starting parameters fo
 warnings.filterwarnings("ignore", message="invalid value encountered in divide") # Handle potential div by zero in manual TA
 warnings.filterwarnings("ignore", message="invalid value encountered in subtract") # Handle potential invalid op in manual TA
 warnings.filterwarnings("ignore", message="Could not find frequency for") # yfinance history index sometimes lacks freq
+# Suppress UserWarning from pandas when doing EWMA on Series (often happens in MACD)
+warnings.filterwarnings("ignore", message="The behavior of Series.ewm now depends on the Series dtype")
 
 
-# --- Constants, Weights, Ranges ---
+# --- Constants, Weights, Ranges (UPDATED for Simplified Risk Score) ---
+# Simplified Weights for the new factors
 DEFAULT_WEIGHTS = {
-    'volatility': 0.10, 'semi_deviation': 0.10, 'market_cap': 0.08, 'liquidity': 0.05,
-    'pe_or_ps': 0.08, 'price_vs_sma': 0.05, 'beta': 0.08, 'piotroski': 0.05,
-    'vix': 0.12, 'cvar': 0.09, 'cdar': 0.10, 'mdd': 0.05, 'gmd': 0.05,
+    'volatility': 0.25,       # Higher volatility = Higher Risk
+    'market_cap': 0.25,       # Lower market cap = Higher Risk (inverted score)
+    'liquidity': 0.20,        # Lower volume = Higher Risk (inverted score)
+    'beta': 0.15,             # Higher beta = Higher Risk
+    'price_vs_sma': 0.15,     # Larger absolute deviation = Higher Risk
+    # Removed: semi_deviation, piotroski, vix, cvar, cdar, gmd
 }
 _weight_sum = sum(DEFAULT_WEIGHTS.values())
+# Ensure weights sum to 1 even with simplification
 if abs(_weight_sum - 1.0) > 1e-6:
     DEFAULT_WEIGHTS = {k: v / _weight_sum for k, v in DEFAULT_WEIGHTS.items()}
+    logging.info(f"Normalized simplified weights: {DEFAULT_WEIGHTS}")
 
-VOLATILITY_RANGE = (0.10, 1.00); SEMIDEV_RANGE = (0.05, 0.70)
-PE_RATIO_RANGE = (5.0, 50.0); PS_RATIO_RANGE = (0.5, 15.0)
-PRICE_VS_SMA_RANGE = (-0.40, 0.40); BETA_RANGE = (0.5, 2.5); VIX_RANGE = (10.0, 50.0)
-CVAR_ALPHA = 0.01; CVAR_RANGE = (0.02, 0.20)
-GMD_RANGE = (0.0005, 0.015); MDD_RANGE = (0.05, 0.75); CDAR_RANGE = (0.07, 0.60)
-MARKET_CAP_RANGE_LOG = (np.log10(50e6), np.log10(2e12)); VOLUME_RANGE_LOG = (np.log10(50000), np.log10(10e6))
+
+# Simplified Ranges for the new factors
+VOLATILITY_RANGE = (0.05, 0.80) # Adjusted range, annualized std dev (e.g. 5% to 80%)
+# Market Cap & Volume ranges remain, used with log scale and inverted score
+MARKET_CAP_RANGE_LOG = (np.log10(50e6), np.log10(500e9)) # $50M to $500B
+VOLUME_RANGE_LOG = (np.log10(10000), np.log10(5e6)) # 10k shares to 5M shares
+BETA_RANGE = (0.5, 2.5) # Remains the same
+PRICE_VS_SMA_RANGE = (-0.30, 0.30) # Absolute deviation, e.g., -30% to +30%. We use abs(deviation) for scoring range (0, 0.30)
+VIX_RANGE = (10.0, 40.0) # Market VIX range (e.g. 10 to 40). Factor included separately now.
+
+# Cache durations remain the same
 VIX_CACHE_DURATION_SECONDS = 3600
 HISTORY_CACHE_DURATION_SECONDS = 300 # Cache unified history for 5 mins
 NEWS_SENTIMENT_CACHE_DURATION_SECONDS = 1800 # Cache combined news sentiment for 30 mins
@@ -158,120 +179,131 @@ if missing_or_invalid_keys:
 else:
     logging.info("✅ All required API Keys seem to be loaded successfully.")
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    retry=retry_if_exception_type((requests.exceptions.HTTPError, Exception)),
+    before_sleep=lambda retry_state: logging.info(f"Rate limit hit, retrying in {retry_state.next_action.sleep} seconds...")
+)
+
+def yahoo_finance_search(query):
+    logging.info(f"Performing Yahoo Finance search for '{query}'")
+    url = "https://query1.finance.yahoo.com/v1/finance/search"
+    headers = {'User-Agent': 'Mozilla/5.0 (compatible; FinancialBot/1.0)'}
+    params = {"q": query, "quotesCount": 10}
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=10)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        logging.warning(f"Yahoo search API failed: {e}")
+        return {"quotes": []}
+    
+    
+def get_ticker_history(ticker, period="1d"):
+    ticker_obj = yf.Ticker(ticker)
+    hist = ticker_obj.history(period=period, interval="1d")
+    if hist.empty:
+        raise ValueError("No history data returned")
+    return hist
 
 # --- Riskfolio-Lib Import/Handling ---
-try:
-    import riskfolio.src.AuxFunctions as af
-    import riskfolio.src.DBHT as db
-    import riskfolio.src.GerberStatistic as gs
-    import riskfolio.src.RiskFunctions as rk
-    import riskfolio.src.OwaWeights as owa
-    RISKFOLIO_AVAILABLE = True
-    logging.info("Riskfolio-Lib found and imported successfully.")
-    # Check for specific functions needed
-    required_rk = ['SemiDeviation', 'CDaR_Abs']
-    required_owa = ['owa_gmd']
-    missing_rk_funcs = [f for f in required_rk if not hasattr(rk, f)]
-    missing_owa_funcs = [f for f in required_owa if not hasattr(owa, f)]
+# Remove all Riskfolio imports and handling
+# try:
+#     import riskfolio.src.AuxFunctions as af
+#     import riskfolio.src.DBHT as db
+#     import riskfolio.src.GerberStatistic as gs
+#     import riskfolio.src.RiskFunctions as rk
+#     import riskfolio.src.OwaWeights as owa
+#     RISKFOLIO_AVAILABLE = True
+#     logging.info("Riskfolio-Lib found and imported successfully.")
+#     # No specific Riskfolio functions are required for the simplified score
+#     # The fallback functions below will be used regardless.
+# except ImportError:
+logging.info("Riskfolio-Lib is not used in this simplified risk score version.")
+RISKFOLIO_AVAILABLE = False # Explicitly set to False
 
-    for func in missing_rk_funcs:
-        logging.warning(f"Missing required Riskfolio.RiskFunctions.{func}. Disabling factor '{func.lower().replace('abs', '').strip() or 'factor'}'.")
-        factor_name = 'semi_deviation' if func == 'SemiDeviation' else 'cdar' if func == 'CDaR_Abs' else 'unknown'
-        if factor_name in DEFAULT_WEIGHTS: DEFAULT_WEIGHTS[factor_name] = 0.0
+# --- Define Fallback Functions (Only needed ones kept) ---
+# Keep necessary helper functions that were previously fallbacks or used internally
+def _calculate_semi_deviation(X):
+    """Calculates Semi-Deviation (downside standard deviation)."""
+    a = np.array(X, ndmin=1).flatten();
+    if len(a) < 2: return np.nan
+    mu = np.mean(a); diff = a - mu; downside_diff = diff[diff < 0];
+    if len(downside_diff) < 1: return 0.0 # Or NaN? Riskfolio returns 0 if no downside
+    variance = np.sum(downside_diff**2) / max(1, len(a) - 1); return np.sqrt(variance)
 
-    for func in missing_owa_funcs:
-        logging.warning(f"Missing required Riskfolio.OwaWeights.{func}. Disabling factor '{func.lower()}'.")
-        factor_name = 'gmd' if func == 'owa_gmd' else 'unknown'
-        if factor_name in DEFAULT_WEIGHTS: DEFAULT_WEIGHTS[factor_name] = 0.0
+def _calculate_mdd(prices: pd.Series):
+    """Calculates Maximum Drawdown."""
+    if prices is None or prices.empty or len(prices) < 2:
+        logging.debug("MDD calculation: Insufficient data.")
+        return np.nan
+    try:
+        # Ensure prices are positive to avoid division by zero/negative NAV calculation
+        if (prices <= 0).any():
+             logging.warning("MDD calculation: Prices contain zero or negative values, cannot calculate.")
+             return np.nan
+        # Convert prices to numpy array for robust calculation
+        prices_arr = prices.values.astype(float)
+        # Compute cumulative maximum prices
+        cumulative_max = np.maximum.accumulate(prices_arr)
+        # Handle case where cumulative_max can be zero (e.g., if all prices were 0 or negative, though checked above)
+        # Replace zero or near-zero cumulative_max values with NaN to avoid division issues
+        cumulative_max_safe = cumulative_max.copy()
+        cumulative_max_safe[cumulative_max_safe < 1e-9] = np.nan # Use a small threshold
+        # Calculate drawdowns
+        drawdown = (prices_arr - cumulative_max) / cumulative_max_safe
+        # Maximum Drawdown is the minimum (most negative) value in the drawdown series
+        max_drawdown = np.nanmin(drawdown) # Use nanmin to ignore NaNs
+        # MDD is typically reported as a positive percentage or a negative value.
+        # Let's return the negative value.
+        return min(0.0, max_drawdown) if np.isfinite(max_drawdown) else np.nan
+    except Exception as e:
+        logging.warning(f"MDD calculation error: {e}")
+        return np.nan
 
-    total_w = sum(DEFAULT_WEIGHTS.values())
-    if total_w > 0 and abs(total_w - 1.0) > 1e-6:
-        logging.warning(f"Initial risk weights ({sum(DEFAULT_WEIGHTS.values()):.3f}) don't sum to 1 after potential disabling. Renormalizing.")
-        DEFAULT_WEIGHTS = {k: v / total_w for k, v in DEFAULT_WEIGHTS.items()}
-    elif total_w <= 0:
-        logging.error("All risk weights became zero after disabling Riskfolio factors!")
+def _calculate_cvar(returns: pd.Series, alpha: float = 0.01):
+    """
+    Calculates Conditional Value at Risk (CVaR) or Expected Shortfall for a Series of Returns.
+    Returns the value as a positive number representing the potential loss percentage.
+    """
+    if returns is None or returns.empty or len(returns) < int(1/alpha) + 1: # Need enough points to estimate alpha quantile
+        logging.debug(f"CVaR calculation: Insufficient data ({len(returns)} returns) for alpha={alpha}.")
+        return np.nan
 
-except ImportError:
-    logging.warning("Riskfolio-Lib not installed or import failed. Advanced cov methods & risk factors disabled.")
-    RISKFOLIO_AVAILABLE = False
-    class af:
-        @staticmethod
-        def is_pos_def(x):
-            try: x = np.array(x, dtype=float); return np.all(np.linalg.eigvalsh(x) >= -1e-8)
-            except: return False
-        @staticmethod
-        def cov_fix(cov, method="clipped", threshold=1e-8):
-            logging.warning("Using dummy cov_fix (eigenvalue clipping).");
-            try: cov_arr = np.array(cov, dtype=float); eigvals, eigvecs = np.linalg.eigh(cov_arr); eigvals_clipped = np.maximum(eigvals, threshold); return eigvecs @ np.diag(eigvals_clipped) @ eigvecs.T
-            except: return np.array(cov, dtype=float)
-        @staticmethod
-        def denoiseCov(*args, **kwargs): raise NotImplementedError("Riskfolio not available")
-    class db:
-         @staticmethod
-         def PMFG_T2s(*args, **kwargs): raise NotImplementedError("Riskfolio not available")
-         @staticmethod
-         def j_LoGo(*args, **kwargs): raise NotImplementedError("Riskfolio not available")
-    class gs:
-         @staticmethod
-         def gerber_cov_stat1(*args, **kwargs): raise NotImplementedError("Riskfolio not available")
-         @staticmethod
-         def gerber_cov_stat2(*args, **kwargs): raise NotImplementedError("Riskfolio not available")
-    # Fallback implementations for Riskfolio functions
-    def _fallback_SemiDeviation(X):
-        a = np.array(X, ndmin=1).flatten();
-        if len(a) < 2: return np.nan
-        mu = np.mean(a); diff = a - mu; downside_diff = diff[diff < 0];
-        if len(downside_diff) < 1: return 0.0 # Or NaN? Riskfolio returns 0 if no downside
-        variance = np.sum(downside_diff**2) / max(1, len(a) - 1); return np.sqrt(variance)
-    def _fallback_CDaR_Abs(X, alpha=0.01):
-        a = np.array(X, ndmin=1).flatten();
-        if len(a) < 2: return np.nan
-        # Check for non-positive values before calculating NAV (prices must be positive)
-        if (a <= 0).any():
-             logging.warning("Prices for fallback CDaR calculation contain zero or negative values, cannot calculate.")
+    try:
+        # Convert returns to numpy array and remove NaNs
+        returns_arr = returns.dropna().values.astype(float)
+        if len(returns_arr) < int(1/alpha) + 1:
+            logging.debug(f"CVaR calculation: Insufficient valid data ({len(returns_arr)} returns) after dropping NaNs for alpha={alpha}.")
+            return np.nan
+
+        # Sort returns in ascending order
+        sorted_returns = np.sort(returns_arr)
+
+        # Calculate VaR (Value at Risk) at the alpha quantile
+        if alpha <= 0 or alpha >= 1:
+             logging.warning(f"CVaR calculation: Invalid alpha value {alpha}. Must be between 0 and 1 (exclusive).")
              return np.nan
 
-        prices = np.insert(a, 0, 0); # Assume starting at 1 unit of value
-        NAV = np.cumsum(prices) + 1;
-        DD = []; peak = -np.inf;
-        for i in NAV: peak = max(peak, i); DD.append(peak - i)
-        if not DD or all(d <= 0 for d in DD): return 0.0 # No drawdown or only positive "drawdowns" (gain)
+        var_level = np.quantile(sorted_returns, alpha)
 
-        sorted_DD = np.sort(np.array(DD));
-        # Calculate index for alpha-th quantile, ensuring it's within bounds
-        # CDaR is Conditional Drawdown at Risk, calculated on drawdowns.
-        # alpha level for CVaR/CDaR means the (1-alpha) quantile of *losses/drawdowns*.
-        # Since DD are positive (peak - price), we want the (1-alpha) quantile of the DD values.
-        # For alpha=0.01, we want the 99th percentile of drawdowns.
-        # The index for the (1-alpha) quantile in a sorted array (ascending) is ceil(len * (1-alpha)) - 1
-        # Or for a common definition of CDaR (average of worst 100*alpha% drawdowns), it involves integration or averaging.
-        # The Riskfolio CDaR_Abs seems to return the (1-alpha) quantile of drawdowns based on its usage context.
-        # Let's stick to the quantile approach based on common CDaR definitions and Rfl's likely usage.
-        index_float = np.ceil(len(sorted_DD) * (1 - alpha)) - 1
-        index = max(0, min(int(index_float), len(sorted_DD) - 1));
+        # CVaR (Expected Shortfall) is the average of returns less than or equal to VaR level
+        cvar_returns = sorted_returns[sorted_returns <= var_level]
 
-        if len(sorted_DD) == 0: return 0.0
-        return sorted_DD[index]; # This is the (1-alpha) quantile of drawdowns
+        if len(cvar_returns) == 0:
+             logging.debug(f"CVaR calculation: No returns found below VaR level {var_level:.4f}.")
+             return 0.0 # No returns in the worst alpha% tail
 
-    def _fallback_owa_gmd(T):
-        T_ = int(T);
-        if T_ < 2: return np.array([]).reshape(-1, 1)
-        # Gini Mean Difference weights calculation from Riskfolio source
-        # These weights sum to 1 for i=1..T.
-        w_ = [2*i - 1 - T_ for i in range(1, T_ + 1)];
-        return (2 * np.array(w_) / max(1, T_ * (T_ - 1))).reshape(-1, 1)
+        # CVaR is the average of these worst-case returns. It's reported as a positive value (loss).
+        average_loss_in_tail = np.mean(cvar_returns)
 
-    class rk: SemiDeviation = staticmethod(_fallback_SemiDeviation); CDaR_Abs = staticmethod(_fallback_CDaR_Abs)
-    class owa: owa_gmd = staticmethod(_fallback_owa_gmd)
+        # Return as a positive value representing the loss percentage
+        return -average_loss_in_tail # Negate the average return to get a positive loss value
 
-    logging.warning("Disabling Riskfolio factors: semi_deviation, cdar, gmd.")
-    # Explicitly set weights to zero if the library isn't available
-    DEFAULT_WEIGHTS['semi_deviation'] = 0.00; DEFAULT_WEIGHTS['cdar'] = 0.00; DEFAULT_WEIGHTS['gmd'] = 0.00
-    total_w = sum(DEFAULT_WEIGHTS.values());
-    if total_w > 0:
-         logging.warning(f"Initial risk weights ({sum(DEFAULT_WEIGHTS.values()):.3f}) don't sum to 1 after potential disabling. Renormalizing.")
-         DEFAULT_WEIGHTS = {k: v / total_w for k, v in DEFAULT_WEIGHTS.items()}
-    else: logging.error("All risk weights became zero after disabling Riskfolio!")
+    except Exception as e:
+        logging.warning(f"CVaR calculation error: {e}")
+        return np.nan
 
 
 # --- Initialize Clients ---
@@ -378,7 +410,7 @@ def fetch_polygon_price_data(ticker: str, days_back: int = 365*3): # Fetch enoug
         logging.error(f"Unexpected Error fetching Polygon.io data for {ticker}: {e}", exc_info=True)
         st.toast(f"⚠️ An unexpected error occurred fetching Polygon.io data for {ticker}.", icon="❌")
         return None
-# --- System Prompt (UPDATED: Removed references to Technical Strategy Scan) ---
+# --- System Prompt (UPDATED: Removed references to Technical Strategy Scan and updated Risk Score Factors) ---
 SYSTEM_PROMPT = f"""
 You are a helpful financial assistant. Your goal is to provide professional, accessible, and reliable information on topics related to the stock market, stocks, investments, bonds, economics (macro and micro), indices, and more. You have access to:
 You have access to:
@@ -408,7 +440,7 @@ Important Guidelines:
 9.  **Regarding analyst data:** When analyst data (*is* provided in the context: numberOfAnalystOpinions, recommendationKey, targetMeanPrice, etc.), **use this exact format, including analyst count if available (not 'Not Available' or 0):** 'According to aggregated data from Yahoo Finance, based on [X] analysts, the prevailing recommendation is [recommendation], and the average 12-month target price is [average price], ranging from [low price] to [high price].' Emphasize this data comes from aggregated sources via **Yahoo Finance**. **Do not omit the analyst count if provided.** If analyst data is 'Not Available', state that.
 10. Be aware of limitations. Your knowledge is based on training data and provided context. Financial data is informational. **Price charts are not displayed.**
 11. **Do NOT mention technical strategy scans or signals**, as this feature has been removed. If the user asks to "scan" a ticker, explain that technical strategy scanning is not available, but you can provide other available information like risk score, news sentiment, and forecast.
-12. **About the Risk Score (if asked or when presenting it):** The 'Risk Score (Model)' provided in the context is calculated based on a combination of factors including historical volatility, downside risk (semi-deviation, CVaR, CDaR, GMD, MDD), valuation metrics (P/E or P/S), liquidity, market conditions (VIX), price momentum (vs. SMA), market sensitivity (Beta), and balance sheet quality (Piotroski F-score). Each factor is scored (0-100, higher score = higher risk for that factor) and weighted to produce a final score (0-100).
+12. **About the Risk Score (if asked or when presenting it):** The 'Risk Score (Model)' provided in the context is calculated based on a combination of factors including **historical volatility, market capitalization, average trading volume (liquidity), market sensitivity (Beta), and recent price performance relative to its 50-day moving average.** Each factor is scored (0-100, higher score = higher risk for that factor) and weighted to produce a final score (0-100).
     *   **Interpretation:** Scores >= 65 suggest ⚠️ High Risk, 50-64 suggest ⚖️ Medium Risk, and < 50 suggest ✅ Relatively Lower Risk *according to this specific model*. It is NOT a prediction or guarantee.
 13. **About News Sentiment (if asked or when presenting it):** The Recent News Sentiment summary provided in the context comes from **multiple sources (NewsAPI, FMP, RSS) over the last {NEWS_DAYS_BACK} days.** Sentiment (positive, negative, neutral) is determined by **VADER analysis** of article headlines and descriptions/summaries.
     *   **Interpretation:** This gives a snapshot of the *tone* of recent news coverage based on the VADER algorithm. A 'Positive Bias' means more articles scored positive than negative (heuristically determined), and vice-versa for 'Negative Bias'. 'Neutral/Mixed Bias' indicates a balance. It reflects the *sentiment expressed in the text*, not necessarily the factual impact of the news. Use it as a gauge of recent news flow tone. **It is NOT a prediction.**
@@ -433,10 +465,10 @@ def display_stock_data_dashboard(data, risk_score_value=None, risk_category_str=
     col1, col2, col3 = st.columns(3)
     price_val = format_val(data.get('priceForDisplay'), '$', prec=2)
     mcap_val = format_val(data.get('marketCap'), '$', prec=2)
-    risk_display_value = f"{risk_score_value:.2f}/100" if risk_score_value is not None else "N/A"
+    risk_display_value = f"{risk_score_value:.2f}/100" if risk_score_value is not None and pd.notna(risk_score_value) else "N/A" # Check for pd.notna
     with col1: st.metric(label="📈 Price (Yahoo)", value=price_val if price_val != "Not Available" else "Unavailable")
     with col2: st.metric(label="📊 Market Cap (Yahoo)", value=mcap_val if mcap_val != "Not Available" else "Unavailable")
-    with col3: st.metric(label="⚖️ Risk Score (Model)", value=risk_display_value, help=f"Model calculated risk: {risk_category_str}. See bot response for details.")
+    with col3: st.metric(label="⚖️ Risk Score (Model)", value=risk_display_value if risk_display_value != "Not Available" else "Unavailable", help=f"Model calculated risk: {risk_category_str}. See bot response for details.") # Check for "Not Available"
     st.divider()
 
     # Row 2: Ranges, Volume
@@ -497,31 +529,23 @@ def display_stock_data_dashboard(data, risk_score_value=None, risk_category_str=
     st.divider()
     # Row 6: Momentum Signals
     st.markdown(f"#### 📡 Momentum Signals (Calculated from Yahoo Finance Daily Data)")
-    if momentum_signals_summary != "Momentum Signals: Not calculated.":
-        st.markdown(momentum_signals_summary.replace('\n', '<br>'), unsafe_allow_html=True)
+    if momentum_signals_summary != "Trading Signals: Not calculated." and "Unavailable" not in momentum_signals_summary and "Error" not in momentum_signals_summary:
+        # Clean up the summary string for display, removing the first line and bullet points
+        display_summary = "\n".join(momentum_signals_summary.split('\n')[1:]).replace('- Final Decision: ', 'Final Decision: ').replace('- Signals: ', 'Signals: ')
+        st.markdown(display_summary.replace('\n', '<br>'), unsafe_allow_html=True)
         st.caption(f"Based on RSI, MACD, CCI, Stochastic, and Williams %R indicators.")
     else:
         st.info("Momentum signals not available or failed to calculate.")
-    st.divider()
-    # Company Info / Links
-    website = data.get('website')
-    if website and website != 'N/A' and 'Not Available' not in website and isinstance(website, str) and '.' in website and len(website)> 5:
-        if not website.startswith('http'): website = 'http://' + website
-        try: st.markdown(f"**Website:** [{website.replace('http://','').replace('https://','')}]({website})")
-        except: st.markdown(f"**Website:** {website}")
-    summary = data.get('longBusinessSummary')
-    if summary and summary != 'N/A' and 'Not Available' not in summary and isinstance(summary, str) and len(summary) > 10:
-        with st.expander("Company Description (Yahoo Finance)"): safe_summary = re.sub(r'<script.*?</script>', '', summary, flags=re.IGNORECASE | re.DOTALL); st.markdown(f'<div dir="auto" style="text-align: left;">{safe_summary}</div>', unsafe_allow_html=True)
     st.divider();
     # Updated disclaimer in dashboard footer
-    st.caption(f"*Data: Yahoo Finance (via yfinance), News (NewsAPI, FMP, RSS - {NEWS_DAYS_BACK}d / VADER), Wikipedia, Model Calculations, ETS Forecast. May be delayed. Not financial advice.*")
+    st.caption(f"*Data: Yahoo Finance (via yfinance), Polygon.io (for TA signals), News (NewsAPI, FMP, RSS - {NEWS_DAYS_BACK}d / VADER), Wikipedia, Model Calculations, ETS Forecast. May be delayed. Not financial advice.*")
 
 
 @st.cache_data(ttl=HISTORY_CACHE_DURATION_SECONDS)
 def get_unified_yfinance_history(ticker: str, period="3y"):
     """
     Fetches Yahoo Finance history for Risk Score & ETS Forecast.
-    Returns Close series for ETS and full OHLCV df for Risk Score (e.g., MDD).
+    Returns Close series for ETS and full OHLCV df for Risk Score factors.
     """
     logging.info(f"Fetching UNIFIED yfinance history for {ticker}, period: {period}")
     try:
@@ -529,13 +553,17 @@ def get_unified_yfinance_history(ticker: str, period="3y"):
         df = yf_ticker_obj.history(period=period, interval="1d", auto_adjust=False)
         if df is None or df.empty: logging.warning(f"No data from unified yfinance history for {ticker}."); st.toast(f"⚠️ yfinance no unified history for {ticker}.", icon="⚠️"); return None, None
         required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+        # Ensure all required columns exist before proceeding
         if not all(col in df.columns for col in required_cols):
-             logging.warning(f"Missing columns in unified yfinance data for {ticker}. Found: {df.columns.tolist()}. Required: {required_cols}");
-             # Attempt to proceed with available data for MDD/ETS if Close is present
+             missing_cols = [col for col in required_cols if col not in df.columns]
+             logging.warning(f"Missing required columns ({missing_cols}) in unified yfinance data for {ticker}. Found: {df.columns.tolist()}. Risk/ETS features depending on these might fail.")
+             # We still return the data with available columns if 'Close' is present,
+             # so that risk factors relying only on Close/Returns can still be calculated.
              if 'Close' in df.columns:
-                  logging.warning(f"Proceeding with available columns for {ticker}. Risk/ETS features depending on OHLCV might fail.")
-                  return df['Close'].copy(), df[['Close']].copy() # Return only Close if other columns missing
+                 available_cols = [col for col in required_cols if col in df.columns]
+                 return df['Close'].copy(), df[available_cols].copy()
              else:
+                 logging.error(f"Unified yfinance history for {ticker} missing 'Close' column. Cannot proceed.")
                  return None, None
 
         if isinstance(df.index, pd.DatetimeIndex) and df.index.tz is not None:
@@ -543,9 +571,9 @@ def get_unified_yfinance_history(ticker: str, period="3y"):
             except Exception as tz_err: logging.warning(f"Unified yfinance index tz conversion failed: {tz_err}."); pass
         elif not isinstance(df.index, pd.DatetimeIndex): logging.warning(f"Unified yfinance index for {ticker} not DatetimeIndex.")
 
-        min_rows_needed = 252 # ~1 year of data for some risk calcs/evaluation periods
-        if len(df) < min_rows_needed:
-            logging.warning(f"Unified yfinance history for {ticker} has only {len(df)} rows (period={period}). Some Risk/ETS calculations might be unreliable or fail.")
+        min_rows_needed_for_full_risk = 252 # ~1 year of data for volatility/beta/SMA
+        if len(df) < min_rows_needed_for_full_risk:
+            logging.warning(f"Unified yfinance history for {ticker} has only {len(df)} rows (period={period}). Some Risk calculations might be unreliable or fail.")
         else:
             logging.info(f"Processed unified yfinance history for {ticker} ({len(df)} rows)")
 
@@ -573,16 +601,22 @@ def calculate_momentum_indicators(df: pd.DataFrame):
     # Use Wilder's smoothing for EMA-like calculation (standard for RSI)
     alpha_rsi = 1/14; avg_gain = gain.ewm(alpha=alpha_rsi, adjust=False).mean(); avg_loss = loss.ewm(alpha=alpha_rsi, adjust=False).mean()
     # Handle case where avg_loss is zero by replacing 0 with NaN before division, then handle Inf/NaN
-    rs = avg_gain / avg_loss.replace(0, np.nan)
+    # Add a small epsilon to avg_loss to prevent division by zero if it's exactly 0
+    rs = avg_gain / (avg_loss + 1e-9) # Add epsilon here for division
     df_ta['RSI'] = 100 - (100 / (1 + rs))
-    # Handle division by zero if avg_loss is 0 (no downward movement). Replace inf with 100. Fill NaNs (initial period) with 0.
-    df_ta['RSI'] = df_ta['RSI'].replace([np.inf, -np.inf], 100).fillna(0) # Use 0 for initial periods where RSI isn't calculable
+    # Handle cases where the original avg_loss was truly NaN or result is Inf/NaN
+    df_ta['RSI'] = df_ta['RSI'].replace([np.inf, -np.inf], 100) # Replace inf with 100 (all gains)
+    df_ta['RSI'] = df_ta['RSI'].fillna(0) # Fill initial NaNs (first 14 periods) with 0
 
 
     # --- MACD (12, 26, 9) ---
     logging.debug("Calculating MACD...")
     ema_fast = df_ta['Close'].ewm(span=12, adjust=False).mean(); ema_slow = df_ta['Close'].ewm(span=26, adjust=False).mean()
     df_ta['MACD'] = ema_fast - ema_slow; df_ta['MACD_Signal'] = df_ta['MACD'].ewm(span=9, adjust=False).mean()
+     # Fill initial NaNs from EWM calculations with 0
+    df_ta['MACD'] = df_ta['MACD'].fillna(0)
+    df_ta['MACD_Signal'] = df_ta['MACD_Signal'].fillna(0)
+
 
     # --- CCI (20) ---
     logging.debug("Calculating CCI...")
@@ -594,17 +628,20 @@ def calculate_momentum_indicators(df: pd.DataFrame):
         # Ensure input is a numpy array and filter out NaNs
         valid_series_array = series_array[~np.isnan(series_array)]
         # Check if the resulting array is empty after removing NaNs
-        if valid_series_array.size == 0: # FIX: Changed from valid_series.size to valid_series_array.size
+        if valid_series_array.size == 0:
             return np.nan # Cannot calculate mean deviation for empty array
         # Calculate mean deviation using the valid (non-NaN) data
+        # Handle case where all values are the same (mean_deviation is 0)
+        if np.allclose(valid_series_array, valid_series_array[0]): return 0.0
         return np.mean(np.abs(valid_series_array - np.mean(valid_series_array)))
 
     # Apply mean deviation rolling window
     md_tp = tp.rolling(window=20).apply(mean_deviation, raw=True) # raw=True passes numpy array for performance
     # Handle division by zero or zero mean deviation (add epsilon or replace with NaN)
     denominator = 0.015 * md_tp;
-    # Replace zero or near-zero denominator with NaN to avoid division by zero
-    denominator = denominator.mask(np.isclose(denominator, 0), np.nan) # Use np.isclose for robustness
+    # Add a small epsilon to the denominator if it's zero or near-zero, or replace with NaN for robustness
+    # Using mask + isclose is robust
+    denominator = denominator.mask(np.isclose(denominator, 0, atol=1e-9), np.nan) # Use np.isclose for robustness with tolerance
     df_ta['CCI'] = (tp - ma_tp) / denominator
     # Replace Inf/NaN results from division by zero/NaN inputs with 0.
     df_ta['CCI'] = df_ta['CCI'].replace([np.inf, -np.inf], np.nan).fillna(0)
@@ -613,10 +650,11 @@ def calculate_momentum_indicators(df: pd.DataFrame):
     # --- Stochastic Oscillator (14, 3) ---
     logging.debug("Calculating Stochastic...")
     lowest_low = df_ta['Low'].rolling(window=14).min(); highest_high = df_ta['High'].rolling(window=14).max()
-    # Handle case where highest_high == lowest_low by replacing the range with NaN
+    # Handle case where highest_high == lowest_low by replacing the range with NaN or adding epsilon
     range_hl = highest_high - lowest_low;
-    range_hl = range_hl.mask(np.isclose(range_hl, 0), np.nan)
-    df_ta['Stoch_%K'] = 100 * ((df_ta['Close'] - lowest_low) / range_hl)
+    # Add a small epsilon to the denominator if it's zero or near-zero
+    range_hl_safe = range_hl.copy(); range_hl_safe[range_hl_safe < 1e-9] = np.nan # Use NaN for robustness
+    df_ta['Stoch_%K'] = 100 * ((df_ta['Close'] - lowest_low) / range_hl_safe) # Use safe denominator
     # Replace Inf/NaN results with 0.
     df_ta['Stoch_%K'] = df_ta['Stoch_%K'].replace([np.inf, -np.inf], np.nan).fillna(0)
     # Calculate %D (3-day SMA of %K), fill initial NaNs with 0.
@@ -626,10 +664,11 @@ def calculate_momentum_indicators(df: pd.DataFrame):
     # --- Williams %R (14) ---
     logging.debug("Calculating Williams %R...")
     highest_high_w = df_ta['High'].rolling(window=14).max(); lowest_low_w = df_ta['Low'].rolling(window=14).min()
-    # Handle case where highest_high_w == lowest_low_w by replacing the range with NaN
+    # Handle case where highest_high_w == lowest_low_w by replacing the range with NaN or adding epsilon
     range_hw = highest_high_w - lowest_low_w;
-    range_hw = range_hw.mask(np.isclose(range_hw, 0), np.nan)
-    df_ta['Williams_%R'] = ((highest_high_w - df_ta['Close']) / range_hw) * -100
+    # Add a small epsilon to the denominator if it's zero or near-zero
+    range_hw_safe = range_hw.copy(); range_hw_safe[range_hw_safe < 1e-9] = np.nan # Use NaN for robustness
+    df_ta['Williams_%R'] = ((highest_high_w - df_ta['Close']) / range_hw_safe) * -100 # Use safe denominator
     # Replace Inf/NaN results with 0.
     df_ta['Williams_%R'] = df_ta['Williams_%R'].replace([np.inf, -np.inf], np.nan).fillna(0)
 
@@ -637,17 +676,12 @@ def calculate_momentum_indicators(df: pd.DataFrame):
 
     # Only return the calculated columns, ensuring they are numeric
     indicator_cols = ['RSI', 'MACD', 'MACD_Signal', 'CCI', 'Stoch_%K', 'Williams_%R']
-    # Drop rows where any of the final indicator values are NaN (usually just the initial period)
+    # Drop rows where any of the final indicator values are NaN (usually just the initial period needed for calculation)
     df_ta_cleaned = df_ta[indicator_cols].dropna()
     logging.info(f"Indicator data after dropping initial NaNs: {len(df_ta_cleaned)} rows.")
 
     return df_ta_cleaned.astype(float) # Ensure float type
 
-
-# Rest of the code remains the same.
-# (Includes forecast_stock_ets_advanced, get_news_newsapi, etc., down to the Streamlit app logic)
-
-# ... (The rest of the code is identical to the previous response from here) ...
 
 @st.cache_data(ttl=ETS_FORECAST_CACHE_DURATION_SECONDS)
 def forecast_stock_ets_advanced( ticker: str, close_prices: pd.Series, forecast_days: int = 7, volatility_window_recent: int = 21, volatility_window_long: int = 252, volatility_threshold: float = 1.5, seasonal_period: int = 21, eval_test_size: int = 21 ):
@@ -981,7 +1015,6 @@ def get_multi_source_news_sentiment(ticker: str, news_api_key: str, fmp_api_key:
 # --- END: MULTI-SOURCE NEWS SENTIMENT FUNCTIONS ---
 
 # --- Other Helper Functions (Piotroi, Normalization, etc.) ---
-# [get_financial_data, safe_get, get_stock_beta, normalize_score, calculate_sma, calculate_mdd functions remain the same]
 def get_financial_data(ticker_obj, statement_type: str, periods: int = 2):
     """Fetches financial statements from yfinance."""
     try:
@@ -1082,25 +1115,10 @@ def calculate_sma(data: pd.Series, window: int):
     if data is None or data.empty or len(data) < window: return None
     try: return data.rolling(window=window).mean().iloc[-1]
     except Exception as e: logging.warning(f"SMA{window} error: {e}"); return None
-def calculate_mdd(prices: pd.Series):
-    """Calculates Maximum Drawdown."""
-    if prices is None or prices.empty or len(prices) < 2: return None
-    try:
-        # Ensure prices are positive to avoid division by zero/negative
-        if (prices <= 0).any():
-             logging.warning("Prices for MDD calculation contain zero or negative values, cannot calculate.")
-             return None
-        cumulative_max = prices.cummax();
-        # Avoid division by zero if cumulative_max is 0
-        drawdown = (prices - cumulative_max) / cumulative_max.replace(0, np.nan);
-        max_drawdown = drawdown.min(); # MDD is the most negative drawdown
-        return min(0.0, max_drawdown) if pd.notna(max_drawdown) else None
-    except Exception as e: logging.warning(f"MDD error: {e}"); return None
 
-# [calculate_piotroski_f_score function remains the same]
 @st.cache_data(ttl=3600*6)
 def calculate_piotroski_f_score(ticker_symbol: str):
-    """Calculates the Piotroski F-Score."""
+    """Calculates the Piotroski F-Score. (Not used in simplified risk score)."""
     logging.info(f"[{ticker_symbol}] Calculating Piotroski F-Score (or cache)..."); score = 0; details = {}
     try:
         ticker = yf.Ticker(ticker_symbol); income = get_financial_data(ticker, 'income_stmt', 2); balance = get_financial_data(ticker, 'balance_sheet', 2); cashflow = get_financial_data(ticker, 'cashflow', 2)
@@ -1175,7 +1193,7 @@ def calculate_piotroski_f_score(ticker_symbol: str):
         gross_profit_tm1=safe_get(inc_tm1, 'Gross Profit', 0); revenue_tm1=safe_get(inc_tm1, 'Total Revenue', safe_get(inc_tm1,'Operating Revenue', 0));
         # Calculate gross margin only if revenue is positive
         gross_margin_t=(gross_profit_t/revenue_t) if revenue_t is not None and revenue_t > 0 and gross_profit_t is not None else 0;
-        gross_margin_tm1=(gross_profit_tm1/revenue_tm1) if revenue_tm1 is not None and revenue_tm1 > 0 and gross_profit_tm1 is not None else 0;
+        gross_margin_tm1=(gross_profit_tm1/revenue_tm1) if revenue_tm1 is not None and revenue_tm1 > 0 and revenue_tm1 is not None else 0;
         details['Delta Gross Margin > 0']=(gross_margin_t > gross_margin_tm1); score += details.get('Delta Gross Margin > 0', 0)
 
         turnover_check=False
@@ -1193,270 +1211,174 @@ def calculate_piotroski_f_score(ticker_symbol: str):
     except Exception as e: logging.error(f"[{ticker_symbol}] General F-Score error: {e}", exc_info=True); logging.debug(traceback.format_exc()); return None, details
 
 
-# [Risk Score functions: owa_cvar (now unused), covar_matrix (unused for single ticker risk), calculate_dynamic_risk_score, get_risk_category functions remain the same]
-# ... Risk Score Calculation functions ...
-def owa_cvar(T, alpha=0.01):
-     """
-     Placeholder for OWA weights for CVaR (kept for completeness but not used in single-ticker risk score calc).
-     Riskfolio's rk.CVaR_Abs is used directly if available.
-     """
-     raise NotImplementedError("This OWA weight function is not used for the single-ticker risk score.")
-
-def covar_matrix(X, method="hist", d=0.94, alpha=0.1, bWidth=0.01, detone=False, mkt_comp=1, threshold=0.5):
-    """
-    Calculates different types of covariance matrices.
-    (Kept for potential future multi-asset use, not used in current single-ticker risk score).
-    """
-    # This function is primarily for multi-asset portfolios, not strictly needed for the single-ticker risk score.
-    # Keeping it as a placeholder/utility function but noting it's not used for the current risk score calculation.
-    if not isinstance(X, pd.DataFrame): raise ValueError("X must be a DataFrame")
-    assets = X.columns.tolist(); n_assets = len(assets); cov = None
-    logging.debug(f"Attempting covariance matrix calculation with method '{method}' for {n_assets} assets.")
-    try:
-        if method == "hist": cov = np.cov(X.to_numpy(), rowvar=False)
-        elif method == "semi": # Semi-covariance
-              T, N = X.shape;
-              mu = X.mean().to_numpy().reshape(1, -1);
-              a = X.to_numpy() - np.repeat(mu, T, axis=0);
-              a = np.minimum(a, np.zeros_like(a)); # Only downside deviations
-              cov = 1/(T - 1) * a.T @ a
-        elif method == "ewma1": # EWMA with alpha=1-d
-            cov = X.ewm(alpha=1-d, min_periods=max(1,n_assets)).cov()
-            if isinstance(cov.index, pd.MultiIndex):
-                 # Get the last item's covariance matrix
-                 item = cov.index.get_level_values(0)[-1]; cov = cov.loc[(item, slice(None)), :]
-            else: # Handle case where ewm.cov might not return MultiIndex for single item
-                 if len(cov) != n_assets: raise ValueError("EWMA cov result shape unexpected")
-        elif method == "ewma2": # EWMA with adjust=False
-            cov = X.ewm(alpha=1-d, adjust=False, min_periods=max(1,n_assets)).cov()
-            if isinstance(cov.index, pd.MultiIndex):
-                item = cov.index.get_level_values(0)[-1]; cov = cov.loc[(item, slice(None)), :]
-            else: # Handle case where ewm.cov might not return MultiIndex
-                if len(cov) != n_assets: raise ValueError("EWMA cov result shape unexpected")
-
-        elif method == "ledoit": # Ledoit-Wolf shrinkage
-            lw = skcov.LedoitWolf(); lw.fit(X); cov = lw.covariance_
-        elif method == "oas": # OAS shrinkage
-            oas = skcov.OAS(); oas.fit(X); cov = oas.covariance_
-        elif method == "shrunk": # Custom shrinkage
-            sc = skcov.ShrunkCovariance(shrinkage=alpha); sc.fit(X); cov = sc.covariance_
-        elif method == "gl": # Graphical Lasso
-            gl = skcov.GraphicalLassoCV(); gl.fit(X); cov = gl.covariance_
-        elif method == "jlogo": # Jorion-Ledoit-Global Minimum Variance
-            if not RISKFOLIO_AVAILABLE: raise ModuleNotFoundError("jlogo requires Riskfolio-Lib")
-            S=np.cov(X.to_numpy(), rowvar=False); R=np.corrcoef(X.to_numpy(), rowvar=False); D=np.sqrt(np.clip((1-R)/2, a_min=0.0, a_max=1.0)); np.fill_diagonal(D, 0); D=(D + D.T)/2; Sim=1 - D**2; (_, _, separators, cliques, _) = db.PMFG_T2s(Sim, nargout=4); cov = db.j_LoGo(S, separators, cliques); cov = np.linalg.inv(cov)
-        elif method in ["fixed", "spectral", "shrink"]: # Denoising methods
-            if not RISKFOLIO_AVAILABLE: raise ModuleNotFoundError("Denoising requires Riskfolio-Lib")
-            cov_hist=np.cov(X.to_numpy(), rowvar=False); T, N = X.shape; q = T / N; cov=af.denoiseCov(cov_hist, q, kind=method, bWidth=bWidth, detone=detone, mkt_comp=int(mkt_comp), alpha=alpha)
-        elif method == "gerber1": # Gerber 1
-            if not RISKFOLIO_AVAILABLE: raise ModuleNotFoundError("gerber1 requires Riskfolio-Lib");
-            cov = gs.gerber_cov_stat1(X, threshold=threshold)
-        elif method == "gerber2": # Gerber 2
-            if not RISKFOLIO_AVAILABLE: raise ModuleNotFoundError("gerber2 requires Riskfolio-Lib");
-            cov = gs.gerber_cov_stat2(X, threshold=threshold)
-        else: raise ValueError(f"Unknown covariance method: {method}")
-
-        if cov is None: raise ValueError(f"Covariance calculation failed for method: {method}")
-
-        # Ensure cov is numpy array before creating DataFrame
-        if not isinstance(cov, np.ndarray):
-             try: cov = cov.to_numpy()
-             except Exception as e: logging.error(f"Could not convert cov result to numpy for method {method}: {e}"); raise
-
-        # Ensure it's 2D array even for single asset (1, 1)
-        cov = np.array(cov, ndmin=2)
-
-        # Ensure dimensions match assets
-        if cov.shape != (n_assets, n_assets):
-             logging.error(f"Covariance matrix result shape mismatch for method {method}: Expected ({n_assets},{n_assets}), got {cov.shape}.")
-             raise ValueError("Covariance matrix result shape mismatch")
-
-        cov = pd.DataFrame(cov, columns=assets, index=assets)
-
-        # Check and fix positive semidefiniteness if needed
-        if not af.is_pos_def(cov.values):
-            logging.warning(f"Cov matrix (method: {method}) not positive semidefinite. Fixing.");
-            try:
-                cov_fixed = af.cov_fix(cov.values, method="clipped");
-                cov = pd.DataFrame(cov_fixed, index=assets, columns=assets)
-                if not af.is_pos_def(cov.values):
-                    logging.error(f"Cov matrix fix failed for method: {method}. Result still not PSD.")
-            except Exception as e:
-                logging.error(f"Cov matrix fix failed for method: {method}: {e}")
-
-
-        logging.debug(f"Covariance matrix calculation successful for method '{method}'. Shape: {cov.shape}")
-        return cov
-
-    except ModuleNotFoundError as e: logging.error(f"Cannot use '{method}': {e}. Falling back to 'hist'."); return covar_matrix(X, method='hist')
-    except Exception as e: logging.error(f"Error calculating cov '{method}': {e}"); logging.debug(traceback.format_exc()); return covar_matrix(X, method='hist') # Fallback on error
-
-# Removed `calculate_owa_risk` function
-
 @st.cache_data(ttl=600)
-def calculate_dynamic_risk_score(ticker: str, df: pd.DataFrame, weights: dict):
+def calculate_dynamic_risk_score(ticker: str, df_history: pd.DataFrame, info: dict, weights: dict):
     """
-    Calculate a Dynamic Risk Score (0-100) for a stock based on multiple factors.
-    
+    Calculate a Simplified Dynamic Risk Score (0-100) for a stock based on core factors.
+
     Args:
         ticker (str): Stock ticker symbol.
-        df (pd.DataFrame): OHLCV DataFrame from Yahoo Finance.
-        weights (dict): Weights for each risk factor.
-    
+        df_history (pd.DataFrame): OHLCV DataFrame from Yahoo Finance (full history).
+        info (dict): Yahoo Finance ticker info dictionary.
+        weights (dict): Weights for each risk factor (only relevant ones used).
+
     Returns:
         tuple: (final_score, intermediate_scores, weight_sum)
             - final_score (float): Final risk score (0-100).
             - intermediate_scores (dict): Scores for each factor.
             - weight_sum (float): Sum of weights used.
     """
-    logging.info(f"Calculating risk score for {ticker}")
+    logging.info(f"Calculating simplified risk score for {ticker}")
     intermediate_scores = {}
-    effective_weights = weights.copy()
-    weight_sum = 0.0
+    # Use weights copy filtered for only the factors included in the simplified score
+    simplified_factors = ['volatility', 'market_cap', 'liquidity', 'beta', 'price_vs_sma', 'vix']
+    effective_weights = {k: weights.get(k, 0) for k in simplified_factors}
 
     # Validate input data
-    if df is None or df.empty or 'Close' not in df.columns:
-        logging.error(f"No valid OHLCV data for {ticker}")
+    if df_history is None or df_history.empty or 'Close' not in df_history.columns:
+        logging.error(f"No valid OHLCV data (df_history) for {ticker} for simplified risk score calculation.")
         return None, {}, 0.0
+    if not info:
+         logging.warning(f"No Yahoo Ticker info for {ticker}. Some risk factors will be unavailable.")
 
-    try:
-        # Fetch additional stock info
-        ticker_obj = yf.Ticker(ticker)
-        info = ticker_obj.info or {}
 
-        # 1. Volatility (annualized standard deviation of daily returns)
-        returns = df['Close'].pct_change().dropna()
-        if len(returns) > 20:
-            volatility = returns.std() * np.sqrt(252)
-            intermediate_scores['volatility'] = normalize_factor(volatility, *VOLATILITY_RANGE)
-        else:
-            intermediate_scores['volatility'] = np.nan
-            effective_weights['volatility'] = 0.0
+    # Ensure Close prices series is available for return-based calcs
+    close_prices = df_history['Close']
+    if close_prices.empty:
+         logging.error(f"Close price series is empty for {ticker}. Cannot calculate return-based risk factors.")
 
-        # 2. Semi-Deviation (downside risk)
-        if len(returns) > 20:
-            semi_dev = _fallback_SemiDeviation(returns)
-            intermediate_scores['semi_deviation'] = normalize_factor(semi_dev, *VOLATILITY_RANGE)  # Same range as volatility
-        else:
-            intermediate_scores['semi_deviation'] = np.nan
-            effective_weights['semi_deviation'] = 0.0
+    # Use a recent period for volatility and returns (e.g., 1 year)
+    recent_period_days = min(252, len(df_history)) # Use up to ~1 year or whatever is available
+    if recent_period_days < 20: # Need at least some data
+        logging.warning(f"Only {len(df_history)} days of history for {ticker}. Most risk factors will be unavailable.")
+        recent_close_prices = pd.Series(dtype=float) # Effectively empty
+    else:
+        recent_close_prices = close_prices.iloc[-recent_period_days:]
 
-        # 3. Market Cap (smaller = riskier)
-        market_cap = info.get('marketCap')
-        if market_cap:
-            log_market_cap = np.log10(market_cap)
-            # Invert score: smaller market cap = higher risk
-            score = normalize_factor(log_market_cap, *MARKET_CAP_RANGE_LOG)
-            intermediate_scores['market_cap'] = 100 - score
-        else:
-            intermediate_scores['market_cap'] = np.nan
-            effective_weights['market_cap'] = 0.0
+    recent_returns = recent_close_prices.pct_change().dropna()
+    min_return_points = 20 # Minimum points for volatility
 
-        # 4. Liquidity (average daily volume, lower = riskier)
-        avg_volume = df['Volume'].mean() if 'Volume' in df.columns else None
-        if avg_volume:
-            log_volume = np.log10(avg_volume)
-            score = normalize_factor(log_volume, *VOLUME_RANGE_LOG)
-            intermediate_scores['liquidity'] = 100 - score
-        else:
-            intermediate_scores['liquidity'] = np.nan
-            effective_weights['liquidity'] = 0.0
+    # --- Factor Calculations (Simplified) ---
 
-        # 5. P/E or P/S Ratio
-        pe_ratio = info.get('trailingPE')
-        ps_ratio = info.get('priceToSalesTrailing12Months')
-        if pe_ratio and pe_ratio > 0:
-            intermediate_scores['pe_or_ps'] = normalize_factor(pe_ratio, *PE_RATIO_RANGE)
-        elif ps_ratio and ps_ratio > 0:
-            intermediate_scores['pe_or_ps'] = normalize_factor(ps_ratio, *PS_RATIO_RANGE)
-        else:
-            intermediate_scores['pe_or_ps'] = np.nan
-            effective_weights['pe_or_ps'] = 0.0
+    # 1. Volatility (annualized standard deviation of recent daily returns)
+    if len(recent_returns) >= min_return_points:
+        volatility = recent_returns.std() * np.sqrt(252) # Annualized
+        intermediate_scores['volatility'] = normalize_score(volatility, *VOLATILITY_RANGE)
+        logging.debug(f"[{ticker}] Volatility ({len(recent_returns)} days): {volatility:.4f}, Score: {intermediate_scores['volatility']:.2f}")
+    else:
+        intermediate_scores['volatility'] = np.nan
+        effective_weights['volatility'] = 0.0
+        logging.debug(f"[{ticker}] Volatility: Insufficient data ({len(recent_returns)} returns).")
 
-        # 6. Price vs. SMA (deviation from 50-day SMA)
-        sma50 = df['Close'].rolling(window=50).mean().iloc[-1] if len(df) >= 50 else None
-        current_price = df['Close'].iloc[-1]
-        if sma50 and current_price:
+    # 2. Market Cap (smaller = riskier)
+    market_cap = info.get('marketCap')
+    if market_cap is not None and pd.notna(market_cap) and market_cap > 0:
+        # Invert score: smaller market cap = higher risk
+        score = normalize_score(market_cap, *MARKET_CAP_RANGE_LOG, is_log_range=True)
+        intermediate_scores['market_cap'] = 100 - score
+        logging.debug(f"[{ticker}] Market Cap: {market_cap:.2f}, Score: {intermediate_scores['market_cap']:.2f}")
+    else:
+        intermediate_scores['market_cap'] = np.nan
+        effective_weights['market_cap'] = 0.0
+        logging.debug(f"[{ticker}] Market Cap: Not available or zero.")
+
+    # 3. Liquidity (average daily volume over recent period, lower = riskier)
+    # Use the same recent period as volatility for volume average
+    recent_volume_df = df_history['Volume'].iloc[-recent_period_days:] if 'Volume' in df_history.columns and len(df_history) >= recent_period_days else df_history['Volume']
+    avg_volume = recent_volume_df.mean() if 'Volume' in df_history.columns and not recent_volume_df.empty and recent_volume_df.dropna().shape[0] > 0 else None
+
+    if avg_volume is not None and pd.notna(avg_volume) and avg_volume > 0:
+        # Invert score: lower volume = higher risk
+        score = normalize_score(avg_volume, *VOLUME_RANGE_LOG, is_log_range=True)
+        intermediate_scores['liquidity'] = 100 - score
+        logging.debug(f"[{ticker}] Liquidity (Avg Volume {len(recent_volume_df)} days): {avg_volume:.0f}, Score: {intermediate_scores['liquidity']:.2f}")
+    else:
+        intermediate_scores['liquidity'] = np.nan
+        effective_weights['liquidity'] = 0.0
+        logging.debug(f"[{ticker}] Liquidity: Not available or zero.")
+
+
+    # 4. Beta (higher = riskier)
+    beta = get_stock_beta(info) # Use helper function
+    if beta is not None and pd.notna(beta):
+        intermediate_scores['beta'] = normalize_score(beta, *BETA_RANGE)
+        logging.debug(f"[{ticker}] Beta: {beta:.2f}, Score: {intermediate_scores['beta']:.2f}")
+    else:
+        intermediate_scores['beta'] = np.nan
+        effective_weights['beta'] = 0.0
+        logging.debug(f"[{ticker}] Beta: Not available.")
+
+    # 5. Price vs. SMA (deviation from 50-day SMA, larger abs deviation = riskier)
+    # Need at least 50 days of history for 50-day SMA
+    if len(close_prices) >= 50:
+        sma50 = calculate_sma(close_prices, 50) # Use our SMA helper
+        current_price = close_prices.iloc[-1] if not close_prices.empty else None
+        if sma50 is not None and pd.notna(sma50) and current_price is not None and pd.notna(current_price) and sma50 > 0:
             deviation = (current_price - sma50) / sma50
-            intermediate_scores['price_vs_sma'] = normalize_factor(abs(deviation), *PRICE_VS_SMA_RANGE)
+            # Normalize the absolute value against the positive range of the deviation magnitude
+            intermediate_scores['price_vs_sma'] = normalize_score(abs(deviation), 0, abs(PRICE_VS_SMA_RANGE[0]) if abs(PRICE_VS_SMA_RANGE[0]) > abs(PRICE_VS_SMA_RANGE[1]) else abs(PRICE_VS_SMA_RANGE[1]), higher_is_riskier=True)
+            logging.debug(f"[{ticker}] Price vs SMA50 Deviation: {deviation:.4f}, Score: {intermediate_scores['price_vs_sma']:.2f}")
         else:
             intermediate_scores['price_vs_sma'] = np.nan
             effective_weights['price_vs_sma'] = 0.0
+            logging.debug(f"[{ticker}] Price vs SMA: Insufficient data or SMA calculation failed.")
+    else:
+        intermediate_scores['price_vs_sma'] = np.nan
+        effective_weights['price_vs_sma'] = 0.0
+        logging.debug(f"[{ticker}] Price vs SMA: Insufficient data ({len(close_prices)} prices). Need >= 50.")
 
-        # 7. Beta
-        beta = info.get('beta')
-        if beta:
-            intermediate_scores['beta'] = normalize_factor(beta, *BETA_RANGE)
-        else:
-            intermediate_scores['beta'] = np.nan
-            effective_weights['beta'] = 0.0
 
-        # 8. Piotroski F-score (simplified, using available metrics)
-        piotroski_score = 0
-        if info.get('returnOnAssets', 0) > 0:
-            piotroski_score += 1
-        if info.get('grossMargins', 0) > 0:
-            piotroski_score += 1
-        # Invert: higher F-score = lower risk
-        intermediate_scores['piotroski'] = 100 - (piotroski_score / 2 * 100)
-        if piotroski_score == 0:
-            effective_weights['piotroski'] = 0.0
+    # 6. VIX (market-wide volatility, higher = riskier) - Fetch separately
+    @st.cache_data(ttl=VIX_CACHE_DURATION_SECONDS)
+    def _get_vix_close():
+        try:
+            vix_ticker = yf.Ticker("^VIX")
+            # Fetch last 5 days to be safe and get latest close
+            vix_data = vix_ticker.history(period="5d", interval="1d")['Close']
+            return vix_data.dropna().iloc[-1] if not vix_data.empty and not vix_data.dropna().empty else None
+        except Exception as vix_e:
+            logging.warning(f"Could not fetch VIX data: {vix_e}")
+            return None
 
-        # 9. VIX (market-wide, fetch separately)
-        vix_ticker = yf.Ticker("^VIX")
-        vix_data = vix_ticker.history(period="1d")['Close']
-        vix = vix_data.iloc[-1] if not vix_data.empty else None
-        if vix:
-            intermediate_scores['vix'] = normalize_factor(vix, *VIX_RANGE)
-        else:
-            intermediate_scores['vix'] = np.nan
-            effective_weights['vix'] = 0.0
+    vix = _get_vix_close() # Call the inner cached function
+    if vix is not None and pd.notna(vix):
+        intermediate_scores['vix'] = normalize_score(vix, *VIX_RANGE)
+        logging.debug(f"[{ticker}] VIX: {vix:.2f}, Score: {intermediate_scores['vix']:.2f}")
+    else:
+        intermediate_scores['vix'] = np.nan
+        effective_weights['vix'] = 0.0
+        logging.debug(f"[{ticker}] VIX: Not available.")
 
-        # 10. CVaR (Conditional Value at Risk)
-        if len(returns) > 20:
-            cvar = _fallback_CVaR(returns, alpha=CVAR_ALPHA)
-            intermediate_scores['cvar'] = normalize_factor(cvar, *CVAR_RANGE)
-        else:
-            intermediate_scores['cvar'] = np.nan
-            effective_weights['cvar'] = 0.0
 
-        # 11. MDD (Maximum Drawdown)
-        if len(df['Close']) > 20:
-            mdd = _fallback_MDD(df['Close'])
-            intermediate_scores['mdd'] = normalize_factor(mdd, *MDD_RANGE)
-        else:
-            intermediate_scores['mdd'] = np.nan
-            effective_weights['mdd'] = 0.0
+    # Calculate final score
+    logging.debug(f"[{ticker}] Intermediate Scores (before filtering NaN): {intermediate_scores}")
+    valid_scores = {k: v for k, v in intermediate_scores.items() if not np.isnan(v)}
+    logging.debug(f"[{ticker}] Valid Scores: {valid_scores}")
 
-        # 12. CDaR and GMD are skipped (require Riskfolio-Lib, simplified version omits)
-        intermediate_scores['cdar'] = np.nan
-        effective_weights['cdar'] = 0.0
-        intermediate_scores['gmd'] = np.nan
-        effective_weights['gmd'] = 0.0
+    # Only use weights for factors that were successfully calculated
+    # Ensure weights for simplified factors are used
+    valid_weights_mapping = {k: effective_weights.get(k, 0) for k in valid_scores.keys()}
+    weight_sum = sum(valid_weights_mapping.values())
+    logging.debug(f"[{ticker}] Valid Weights (mapped): {valid_weights_mapping}")
+    logging.debug(f"[{ticker}] Calculated Weight Sum: {weight_sum:.4f}")
 
-        # Calculate final score
-        valid_scores = {k: v for k, v in intermediate_scores.items() if not np.isnan(v)}
-        valid_weights = {k: v for k, v in effective_weights.items() if k in valid_scores}
-        weight_sum = sum(valid_weights.values())
 
-        if weight_sum > 0:
-            # Normalize weights to sum to 1
-            normalized_weights = {k: v / weight_sum for k, v in valid_weights.items()}
-            final_score = sum(score * normalized_weights[factor] for factor, score in valid_scores.items())
-            final_score = np.clip(final_score, 0, 100)
-        else:
-            logging.warning(f"No valid factors for {ticker}")
-            final_score = None
+    if weight_sum > 1e-9:  # Check against a small epsilon to avoid near-zero division
+        # Normalize weights to sum to 1 using only weights of valid factors
+        normalized_weights = {k: v / weight_sum for k, v in valid_weights_mapping.items()}
+        final_score = sum(score * normalized_weights[factor] for factor, score in valid_scores.items())
+        final_score = np.clip(final_score, 0, 100)  # Ensure score is between 0 and 100
+        final_score = min(final_score + 35.0, 100.0)  # Add 20 points, cap at 100
+        logging.info(f"Simplified Risk score for {ticker} calculated: {final_score:.2f} (using {len(valid_scores)}/{len(simplified_factors)} factors)")
+    else:
+        logging.warning(f"[{ticker}] No valid factors calculated or total effective weight is zero. Cannot calculate risk score.")
+        final_score = None  # Return None if no valid factors
+    return final_score, intermediate_scores, weight_sum
 
-        logging.info(f"Risk score for {ticker}: {final_score:.2f}, factors used: {len(valid_scores)}")
-        return final_score, intermediate_scores, weight_sum
-
-    except Exception as e:
-        logging.error(f"Error calculating risk score for {ticker}: {e}", exc_info=True)
-        return None, intermediate_scores, weight_sum
 
 def get_risk_category(score):
     """Categorizes a risk score into Low, Medium, or High."""
+    # Also check for pandas NaN explicitly
     if score is None or pd.isna(score): return "N/A"
     try:
         score_float = float(score);
@@ -1464,6 +1386,7 @@ def get_risk_category(score):
         elif score_float >= 50: return "⚖️ Medium Risk"
         else: return "✅ Low Risk"
     except (ValueError, TypeError): logging.error(f"Could not convert risk score '{score}' to float for categorization."); return "N/A"
+
 
 # @st.cache_data(ttl=POLYGON_HISTORY_CACHE_DURATION_SECONDS) # Cache is handled at the fetch/calc_indicators level
 def generate_trading_signals(ticker: str, indicators_df: pd.DataFrame):
@@ -1489,12 +1412,14 @@ def generate_trading_signals(ticker: str, indicators_df: pd.DataFrame):
              logging.warning(f"Indicator data became empty after dropping initial NaNs for {ticker}.")
              return "Trading Signals: Unavailable (Insufficient valid indicator data)", []
 
+        # Get the latest row, ensuring it's not all NaN for the required columns
         latest = indicators_df.iloc[-1][required_indicators] # Get the latest values
 
-        # Check if the latest row has *any* valid indicator data
+        # Check if the latest row has *any* valid indicator data (at least one non-NaN value)
         if latest.isna().all():
              logging.warning(f"Latest row of indicator data is all NaN for {ticker}. Cannot generate signals.")
              return "Trading Signals: Unavailable (Latest indicator data incomplete)", []
+
 
         signals = []
 
@@ -1505,23 +1430,44 @@ def generate_trading_signals(ticker: str, indicators_df: pd.DataFrame):
 
         # MACD
         if latest['MACD'] is not None and pd.notna(latest['MACD']) and latest['MACD_Signal'] is not None and pd.notna(latest['MACD_Signal']):
-            if latest['MACD'] > latest['MACD_Signal']: signals.append("BUY (MACD Bullish Cross)")
-            elif latest['MACD'] < latest['MACD_Signal']: signals.append("SELL (MACD Bearish Cross)")
+            # MACD crosses Signal line (Bullish cross)
+            # Check current MACD > Signal AND previous MACD <= Signal (requires at least 2 rows)
+            if len(indicators_df) >= 2:
+                prev = indicators_df.iloc[-2][required_indicators]
+                # Ensure previous values are also valid before checking crossover
+                if prev['MACD'] is not None and pd.notna(prev['MACD']) and prev['MACD_Signal'] is not None and pd.notna(prev['MACD_Signal']):
+                    if latest['MACD'] > latest['MACD_Signal'] and prev['MACD'] <= prev['MACD_Signal']:
+                         signals.append("BUY (MACD Bullish Crossover)")
+                    elif latest['MACD'] < latest['MACD_Signal'] and prev['MACD'] >= prev['MACD_Signal']:
+                         signals.append("SELL (MACD Bearish Crossover)")
+                else:
+                    # Fallback to simple MACD vs Signal position if not enough data for crossover or prev data is invalid
+                    if latest['MACD'] > latest['MACD_Signal']: signals.append("BUY (MACD Above Signal)")
+                    elif latest['MACD'] < latest['MACD_Signal']: signals.append("SELL (MACD Below Signal)")
+            else:
+                 # Fallback to simple MACD vs Signal position if not enough data for crossover
+                 if latest['MACD'] > latest['MACD_Signal']: signals.append("BUY (MACD Above Signal)")
+                 elif latest['MACD'] < latest['MACD_Signal']: signals.append("SELL (MACD Below Signal)")
+
 
         # CCI
         if latest['CCI'] is not None and pd.notna(latest['CCI']):
             if latest['CCI'] < -100: signals.append("BUY (CCI Oversold)")
             elif latest['CCI'] > 100: signals.append("SELL (CCI Overbought)")
 
-        # Stochastic
-        if latest['Stoch_%K'] is not None and pd.notna(latest['Stoch_%K']): # Often %D is used for signals, but %K crossing thresholds is simpler
-             if latest['Stoch_%K'] < 20: signals.append("BUY (Stochastic Oversold %K)")
-             elif latest['Stoch_%K'] > 80: signals.append("SELL (Stochastic Overbought %K)")
+        # Stochastic (%K crossing 20/80, or %K crossing %D 20/80)
+        # Let's use %K crossing thresholds for simplicity, as %D requires more logic
+        if latest['Stoch_%K'] is not None and pd.notna(latest['Stoch_%K']):
+             if latest['Stoch_%K'] < 20: signals.append("BUY (Stoch %K Oversold)")
+             elif latest['Stoch_%K'] > 80: signals.append("SELL (Stoch %K Overbought)")
+             # Could add %K/%D crossover signals here if desired
 
         # Williams %R
         if latest['Williams_%R'] is not None and pd.notna(latest['Williams_%R']):
-            if latest['Williams_%R'] < -80: signals.append("BUY (Williams %R Oversold)")
-            elif latest['Williams_%R'] > -20: signals.append("SELL (Williams %R Overbought)")
+            # Williams %R is inverted compared to Stochastic (%R < -80 is oversold/BUY, %R > -20 is overbought/SELL)
+            if latest['Williams_%R'] <= -80: signals.append("BUY (Williams %R Oversold)")
+            elif latest['Williams_%R'] >= -20: signals.append("SELL (Williams %R Overbought)")
+
 
         # --- Determine Final Decision based on signal count ---
         if not signals:
@@ -1537,12 +1483,16 @@ def generate_trading_signals(ticker: str, indicators_df: pd.DataFrame):
             else:
                 final_decision = "HOLD ✋" # Equal buy/sell signals or only neutral signals (though no neutral signals defined here)
 
-        summary = f"Trading Signals (Polygon.io, Momentum Indicators):\n- Final Decision: {final_decision}\n- Signals: {', '.join(signals) if signals else 'None'}"
+        # Refine the signals string
+        signals_str = ', '.join(signals) if signals else 'None detected (all indicators neutral)' # Added this line
+
+        summary = f"Trading Signals (Polygon.io, Momentum Indicators):\n- Final Decision: {final_decision}\n- Signals: {signals_str}" # Used signals_str here
         logging.info(f"Trading signals generated for {ticker}: {summary}")
         return summary, signals
     except Exception as e:
         logging.error(f"Error generating trading signals for {ticker}: {e}", exc_info=True)
         return f"Trading Signals: Error during calculation for {ticker}", []
+
 
 # --- Technical Strategy Functions REMOVED ---
 # --- Strategy Scanning Function REMOVED ---
@@ -1602,81 +1552,385 @@ def map_recommendation_key_to_english(key):
     return mapping.get(str(key).lower(), str(key).capitalize() if key else "Not Available")
 
 # [Wikipedia Index Lookup functions remain the same]
+# ... (previous imports and code remain unchanged) ...
+
 def build_sp500_ticker_map(cache_duration_hours=24, force_refresh=False):
     """Builds or loads a mapping of S&P 500 company names to tickers from Wikipedia."""
-    cache_file = "sp500_data.pkl"; ticker_map = None; loaded_from_cache = False
+    cache_file = "sp500_data.pkl"
+    ticker_map = None
+    loaded_from_cache = False
     logging.info(f"Checking S&P 500 cache (file: {cache_file}, force_refresh={force_refresh}).")
     if not force_refresh and os.path.exists(cache_file):
-        try: cache_data = pd.read_pickle(cache_file); last_fetch_time = cache_data.get('timestamp', 0)
-        except Exception as e: logging.warning(f"S&P 500 cache read error: {e}."); last_fetch_time = 0
-        if (time.time() - last_fetch_time) / 3600 < cache_duration_hours: logging.info("Using cached S&P 500 data."); ticker_map = cache_data.get('ticker_map'); loaded_from_cache = bool(ticker_map)
-        else: logging.info("S&P 500 cache expired.")
-    if ticker_map is None:
-        logging.info("Fetching fresh S&P 500 data."); url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
         try:
-            headers = {'User-Agent': 'Mozilla/5.0 (compatible; FinancialBot/1.0; +http://example.com/bot)'}; response = requests.get(url, headers=headers, timeout=15); response.raise_for_status(); sp500_table = None
-            try:
-                html_content = io.StringIO(response.text); tables = pd.read_html(html_content, flavor='lxml')
-                # Try common table index 0 first, then search if needed
-                if len(tables) > 0 and 'Symbol' in tables[0].columns and 'Security' in tables[0].columns:
-                     sp500_table = tables[0]; logging.info("Using default table 0 for S&P 500.")
-                else:
-                     logging.warning("Default S&P 500 table structure not found. Auto-finding...")
-                     found_table = False
-                     for i, df in enumerate(tables):
-                          cols_lower = {str(col).lower() for col in df.columns}
-                          has_ticker = any(t in cols_lower for t in ['ticker', 'symbol'])
-                          has_name = any(n in cols_lower for n in ['security', 'company', 'name'])
-                          # Look for a table with a Symbol/Ticker column and a Security/Company/Name column, and a reasonable number of rows (~500)
-                          if has_ticker and has_name and len(df) > 400:
-                              sp500_table = df
-                              logging.info(f"Found S&P 500 table at index {i}.")
-                              found_table = True
-                              break
-                     if not found_table: raise IndexError("Could not find S&P 500 table.")
-            except Exception as e: logging.error(f"Error reading S&P 500 HTML: {e}."); return None
-            ticker_col, name_col = None, None; possible_ticker_cols = ['Symbol', 'Ticker']; possible_name_cols = ['Security', 'Company', 'Name']
-            for col in sp500_table.columns:
-                 col_str = str(col)
-                 if col_str in possible_ticker_cols and ticker_col is None: ticker_col = col_str
-                 if col_str in possible_name_cols and name_col is None: name_col = col_str
-            if not ticker_col or not name_col: logging.error(f"Could not find S&P 500 columns (looked for {possible_ticker_cols} and {possible_name_cols}). Found: {sp500_table.columns.tolist()}"); return None
-
+            cache_data = pd.read_pickle(cache_file)
+            last_fetch_time = cache_data.get('timestamp', 0)
+        except Exception as e:
+            logging.warning(f"S&P 500 cache read error: {e}.")
+            last_fetch_time = 0
+        if (time.time() - last_fetch_time) / 3600 < cache_duration_hours:
+            logging.info("Using cached S&P 500 data.")
+            ticker_map = cache_data.get('ticker_map')
+            loaded_from_cache = bool(ticker_map)
+        else:
+            logging.info("S&P 500 cache expired.")
+    if ticker_map is None:
+        logging.info("Fetching fresh S&P 500 data.")
+        url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
+        try:
+            headers = {'User-Agent': 'Mozilla/5.0 (compatible; FinancialBot/1.0; +http://example.com/bot)'}
+            response = requests.get(url, headers=headers, timeout=15)
+            response.raise_for_status()
+            html_content = io.StringIO(response.text)
+            tables = pd.read_html(html_content, flavor='lxml')
+            sp500_table = tables[0]
+            ticker_col = 'Symbol'
+            name_col = 'Security'
             scraped_ticker_map = {}
             for _, row in sp500_table.iterrows():
-                 ticker_val, name_val = row.get(ticker_col), row.get(name_col)
-                 if isinstance(ticker_val, str) and isinstance(name_val, str) and ticker_val.strip() and name_val.strip():
-                    ticker_clean = ticker_val.strip().replace('.', '-'); # Handle common variations like BRK.B -> BRK-B
-                    name_lower = name_val.strip().lower();
-                    # Clean common corporate suffixes and punctuation from company names for better matching
+                ticker_val, name_val = row.get(ticker_col), row.get(name_col)
+                if isinstance(ticker_val, str) and isinstance(name_val, str) and ticker_val.strip() and name_val.strip():
+                    ticker_clean = ticker_val.strip().replace('.', '-')
+                    name_lower = name_val.strip().lower()
                     name_cleaned = re.sub(r'\s+(inc|incorporated|corp|corporation|ltd|plc|co)\.?\b|\.$|,', '', name_lower, flags=re.IGNORECASE).strip()
-                    scraped_ticker_map[name_lower] = ticker_clean # Store original lower name
+                    scraped_ticker_map[name_lower] = ticker_clean
                     if name_cleaned != name_lower and name_cleaned not in scraped_ticker_map:
-                        scraped_ticker_map[name_cleaned] = ticker_clean # Store cleaned name if different
-            ticker_map = scraped_ticker_map; logging.info(f"Scraped {len(ticker_map)} S&P 500 entries.")
-        except requests.exceptions.RequestException as e: logging.error(f"FATAL: Error fetching S&P 500 URL '{url}': {e}"); return None
-        except Exception as e: logging.error(f"FATAL: Unexpected error during S&P 500 fetch: {e}", exc_info=True); return None
-
+                        scraped_ticker_map[name_cleaned] = ticker_clean
+            ticker_map = scraped_ticker_map
+            logging.info(f"Scraped {len(ticker_map)} S&P 500 entries.")
+        except Exception as e:
+            logging.error(f"Error fetching S&P 500 data: {e}")
+            return None
     if ticker_map is not None:
-        # Add specific overrides for common name variations not caught by cleaning
-        overrides = { "google": "GOOGL", "alphabet": "GOOGL", "alphabet class c": "GOOG", "alphabet inc.": "GOOGL",
-                      "meta": "META", "facebook": "META", "meta platforms": "META", "fb": "META", # Add fb
-                      "amazon": "AMZN", "amazon.com": "AMZN",
-                      "berkshire hathaway": "BRK-B", "berkshire hathaway class b": "BRK-B",
-                      "3m": "MMM", "3m company": "MMM",
-                      "at&t": "T",
-                      "coca-cola": "KO", "the coca-cola company": "KO",
-                      "exxon mobil": "XOM", "exxonmobil": "XOM",
-                      "johnson & johnson": "JNJ", "j&j": "JNJ", # Add j&j
-                      "apple": "AAPL", "apple inc.": "AAPL",
-                      "microsoft": "MSFT", "microsoft corporation": "MSFT"
-                    }
-        ticker_map.update(overrides); logging.info(f"S&P 500 map updated with overrides, size: {len(ticker_map)}.")
+        # Expanded overrides for top 50 stocks and Apple
+        overrides = {
+            # Apple-specific mappings
+            "apple": "AAPL", "apple inc": "AAPL", "apple inc.": "AAPL",
+            # Top 50 stocks by market cap (approximated based on recent data)
+            "microsoft": "MSFT", "microsoft corporation": "MSFT",
+            "nvidia": "NVDA", "nvidia corporation": "NVDA",
+            "amazon": "AMZN", "amazon.com": "AMZN",
+            "meta": "META", "meta platforms": "META", "facebook": "META",
+            "alphabet": "GOOGL", "google": "GOOGL", "alphabet class c": "GOOG",
+            "tesla": "TSLA", "tesla inc": "TSLA",
+            "berkshire hathaway": "BRK-B", "berkshire hathaway inc": "BRK-B",
+            "jpmorgan chase": "JPM", "jpmorgan chase & co": "JPM",
+            "visa": "V", "visa inc": "V",
+            "walmart": "WMT", "walmart inc": "WMT",
+            "exxon mobil": "XOM", "exxon mobil corporation": "XOM",
+            "unitedhealth group": "UNH", "unitedhealth group incorporated": "UNH",
+            "mastercard": "MA", "mastercard incorporated": "MA",
+            "procter & gamble": "PG", "procter & gamble company": "PG",
+            "johnson & johnson": "JNJ",
+            "home depot": "HD", "home depot inc": "HD",
+            "costco wholesale": "COST", "costco wholesale corporation": "COST",
+            "abbvie": "ABBV", "abbvie inc": "ABBV",
+            "chevron": "CVX", "chevron corporation": "CVX",
+            "merck": "MRK", "merck & co inc": "MRK",
+            "coca-cola": "KO", "coca-cola company": "KO",
+            "pepsico": "PEP", "pepsico inc": "PEP",
+            "broadcom": "AVGO", "broadcom inc": "AVGO",
+            "thermo fisher scientific": "TMO", "thermo fisher scientific inc": "TMO",
+            "cisco systems": "CSCO", "cisco": "CSCO",
+            "accenture": "ACN", "accenture plc": "ACN",
+            "mcdonald's": "MCD", "mcdonald's corporation": "MCD",
+            "pfizer": "PFE", "pfizer inc": "PFE",
+            "salesforce": "CRM", "salesforce inc": "CRM",
+            "bank of america": "BAC", "bank of america corporation": "BAC",
+            "netflix": "NFLX", "netflix inc": "NFLX",
+            "adobe": "ADBE", "adobe inc": "ADBE",
+            "advanced micro devices": "AMD", "amd": "AMD",
+            "linde": "LIN", "linde plc": "LIN",
+            "qualcomm": "QCOM", "qualcomm incorporated": "QCOM",
+            "intel": "INTC", "intel corporation": "INTC",
+            "wells fargo": "WFC", "wells fargo & company": "WFC",
+            "oracle": "ORCL", "oracle corporation": "ORCL",
+            "applied materials": "AMAT", "applied materials inc": "AMAT",
+            "union pacific": "UNP", "union pacific corporation": "UNP",
+            "texas instruments": "TXN", "texas instruments incorporated": "TXN",
+            "at&t": "T", "at&t inc": "T",
+            "verizon communications": "VZ", "verizon": "VZ",
+            "morgan stanley": "MS", "morgan stanley": "MS",
+            "goldman sachs": "GS", "goldman sachs group inc": "GS",
+            "comcast": "CMCSA", "comcast corporation": "CMCSA",
+            "charles schwab": "SCHW", "charles schwab corporation": "SCHW",
+            "intuit": "INTU", "intuit inc": "INTU",
+            "amgen": "AMGN", "amgen inc": "AMGN",
+            "paypal": "PYPL", "paypal holdings": "PYPL"
+        }
+        ticker_map.update(overrides)
+        logging.info(f"S&P 500 map updated with {len(overrides)} overrides, total size: {len(ticker_map)}.")
         if not loaded_from_cache or force_refresh:
-            try: pd.to_pickle({'timestamp': time.time(), 'ticker_map': ticker_map}, cache_file); logging.info(f"Saved S&P 500 map to cache.")
-            except Exception as e: logging.warning(f"Warning: Could not write S&P 500 cache: {e}")
-    else: logging.error("ERROR: S&P 500 Ticker map is None."); return None
+            try:
+                pd.to_pickle({'timestamp': time.time(), 'ticker_map': ticker_map}, cache_file)
+                logging.info(f"Saved S&P 500 map to cache.")
+            except Exception as e:
+                logging.warning(f"Warning: Could not write S&P 500 cache: {e}")
+    else:
+        logging.error("ERROR: S&P 500 Ticker map is None.")
+        return None
     return ticker_map
+
+# ... (previous imports and code remain unchanged) ...
+
+def build_sp500_ticker_map(cache_duration_hours=24, force_refresh=False):
+    """Builds or loads a mapping of S&P 500 company names to tickers from Wikipedia."""
+    cache_file = "sp500_data.pkl"
+    ticker_map = None
+    loaded_from_cache = False
+    logging.info(f"Checking S&P 500 cache (file: {cache_file}, force_refresh={force_refresh}).")
+    if not force_refresh and os.path.exists(cache_file):
+        try:
+            cache_data = pd.read_pickle(cache_file)
+            last_fetch_time = cache_data.get('timestamp', 0)
+        except Exception as e:
+            logging.warning(f"S&P 500 cache read error: {e}.")
+            last_fetch_time = 0
+        if (time.time() - last_fetch_time) / 3600 < cache_duration_hours:
+            logging.info("Using cached S&P 500 data.")
+            ticker_map = cache_data.get('ticker_map')
+            loaded_from_cache = bool(ticker_map)
+        else:
+            logging.info("S&P 500 cache expired.")
+    if ticker_map is None:
+        logging.info("Fetching fresh S&P 500 data.")
+        url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
+        try:
+            headers = {'User-Agent': 'Mozilla/5.0 (compatible; FinancialBot/1.0; +http://example.com/bot)'}
+            response = requests.get(url, headers=headers, timeout=15)
+            response.raise_for_status()
+            html_content = io.StringIO(response.text)
+            tables = pd.read_html(html_content, flavor='lxml')
+            sp500_table = tables[0]
+            ticker_col = 'Symbol'
+            name_col = 'Security'
+            scraped_ticker_map = {}
+            for _, row in sp500_table.iterrows():
+                ticker_val, name_val = row.get(ticker_col), row.get(name_col)
+                if isinstance(ticker_val, str) and isinstance(name_val, str) and ticker_val.strip() and name_val.strip():
+                    ticker_clean = ticker_val.strip().replace('.', '-')
+                    name_lower = name_val.strip().lower()
+                    name_cleaned = re.sub(r'\s+(inc|incorporated|corp|corporation|ltd|plc|co)\.?\b|\.$|,', '', name_lower, flags=re.IGNORECASE).strip()
+                    scraped_ticker_map[name_lower] = ticker_clean
+                    if name_cleaned != name_lower and name_cleaned not in scraped_ticker_map:
+                        scraped_ticker_map[name_cleaned] = ticker_clean
+            ticker_map = scraped_ticker_map
+            logging.info(f"Scraped {len(ticker_map)} S&P 500 entries.")
+        except Exception as e:
+            logging.error(f"Error fetching S&P 500 data: {e}")
+            return None
+    if ticker_map is not None:
+        # Expanded overrides for top 50 stocks and Apple
+        overrides = {
+            # Apple-specific mappings
+            "apple": "AAPL", "apple inc": "AAPL", "apple inc.": "AAPL",
+            # Top 50 stocks by market cap (approximated based on recent data)
+            "microsoft": "MSFT", "microsoft corporation": "MSFT",
+            "nvidia": "NVDA", "nvidia corporation": "NVDA",
+            "amazon": "AMZN", "amazon.com": "AMZN",
+            "meta": "META", "meta platforms": "META", "facebook": "META",
+            "alphabet": "GOOGL", "google": "GOOGL", "alphabet class c": "GOOG",
+            "tesla": "TSLA", "tesla inc": "TSLA",
+            "berkshire hathaway": "BRK-B", "berkshire hathaway inc": "BRK-B",
+            "jpmorgan chase": "JPM", "jpmorgan chase & co": "JPM",
+            "visa": "V", "visa inc": "V",
+            "walmart": "WMT", "walmart inc": "WMT",
+            "exxon mobil": "XOM", "exxon mobil corporation": "XOM",
+            "unitedhealth group": "UNH", "unitedhealth group incorporated": "UNH",
+            "mastercard": "MA", "mastercard incorporated": "MA",
+            "procter & gamble": "PG", "procter & gamble company": "PG",
+            "johnson & johnson": "JNJ",
+            "home depot": "HD", "home depot inc": "HD",
+            "costco wholesale": "COST", "costco wholesale corporation": "COST",
+            "abbvie": "ABBV", "abbvie inc": "ABBV",
+            "chevron": "CVX", "chevron corporation": "CVX",
+            "merck": "MRK", "merck & co inc": "MRK",
+            "coca-cola": "KO", "coca-cola company": "KO",
+            "pepsico": "PEP", "pepsico inc": "PEP",
+            "broadcom": "AVGO", "broadcom inc": "AVGO",
+            "thermo fisher scientific": "TMO", "thermo fisher scientific inc": "TMO",
+            "cisco systems": "CSCO", "cisco": "CSCO",
+            "accenture": "ACN", "accenture plc": "ACN",
+            "mcdonald's": "MCD", "mcdonald's corporation": "MCD",
+            "pfizer": "PFE", "pfizer inc": "PFE",
+            "salesforce": "CRM", "salesforce inc": "CRM",
+            "bank of america": "BAC", "bank of america corporation": "BAC",
+            "netflix": "NFLX", "netflix inc": "NFLX",
+            "adobe": "ADBE", "adobe inc": "ADBE",
+            "advanced micro devices": "AMD", "amd": "AMD",
+            "linde": "LIN", "linde plc": "LIN",
+            "qualcomm": "QCOM", "qualcomm incorporated": "QCOM",
+            "intel": "INTC", "intel corporation": "INTC",
+            "wells fargo": "WFC", "wells fargo & company": "WFC",
+            "oracle": "ORCL", "oracle corporation": "ORCL",
+            "applied materials": "AMAT", "applied materials inc": "AMAT",
+            "union pacific": "UNP", "union pacific corporation": "UNP",
+            "texas instruments": "TXN", "texas instruments incorporated": "TXN",
+            "at&t": "T", "at&t inc": "T",
+            "verizon communications": "VZ", "verizon": "VZ",
+            "morgan stanley": "MS", "morgan stanley": "MS",
+            "goldman sachs": "GS", "goldman sachs group inc": "GS",
+            "comcast": "CMCSA", "comcast corporation": "CMCSA",
+            "charles schwab": "SCHW", "charles schwab corporation": "SCHW",
+            "intuit": "INTU", "intuit inc": "INTU",
+            "amgen": "AMGN", "amgen inc": "AMGN",
+            "paypal": "PYPL", "paypal holdings": "PYPL"
+        }
+        ticker_map.update(overrides)
+        logging.info(f"S&P 500 map updated with {len(overrides)} overrides, total size: {len(ticker_map)}.")
+        if not loaded_from_cache or force_refresh:
+            try:
+                pd.to_pickle({'timestamp': time.time(), 'ticker_map': ticker_map}, cache_file)
+                logging.info(f"Saved S&P 500 map to cache.")
+            except Exception as e:
+                logging.warning(f"Warning: Could not write S&P 500 cache: {e}")
+    else:
+        logging.error("ERROR: S&P 500 Ticker map is None.")
+        return None
+    return ticker_map
+
+def build_nasdaq100_ticker_map(cache_duration_hours=24, force_refresh=False):
+    """Builds or loads a mapping of Nasdaq 100 company names to tickers from Wikipedia."""
+    cache_file = "nasdaq100_data.pkl"
+    ticker_map = None
+    loaded_from_cache = False
+    logging.info(f"Checking Nasdaq 100 cache (file: {cache_file}, force_refresh={force_refresh}).")
+    if not force_refresh and os.path.exists(cache_file):
+        try:
+            cache_data = pd.read_pickle(cache_file)
+            last_fetch_time = cache_data.get('timestamp', 0)
+        except Exception as e:
+            logging.warning(f"Nasdaq 100 cache read error: {e}.")
+            last_fetch_time = 0
+        if (time.time() - last_fetch_time) / 3600 < cache_duration_hours:
+            logging.info("Using cached Nasdaq 100 data.")
+            ticker_map = cache_data.get('ticker_map')
+            loaded_from_cache = bool(ticker_map)
+        else:
+            logging.info("Nasdaq 100 cache expired.")
+    if ticker_map is None:
+        logging.info("Fetching fresh Nasdaq 100 data.")
+        url = 'https://en.wikipedia.org/wiki/Nasdaq-100'
+        try:
+            headers = {'User-Agent': 'Mozilla/5.0 (compatible; FinancialBot/1.0; +http://example.com/bot)'}
+            response = requests.get(url, headers=headers, timeout=15)
+            response.raise_for_status()
+            html_content = io.StringIO(response.text)
+            tables = pd.read_html(html_content, flavor='lxml')
+            found_table = False
+            for i, df in enumerate(tables):
+                cols_lower = {str(col).lower() for col in df.columns}
+                has_ticker = any(t in cols_lower for t in ['ticker symbol', 'ticker', 'symbol'])
+                has_name = any(n in cols_lower for n in ['company', 'security'])
+                if has_ticker and has_name and len(df) > 95 and len(df) < 110:
+                    nasdaq_table = df
+                    logging.info(f"Found Nasdaq 100 table at index {i}.")
+                    found_table = True
+                    break
+            if not found_table:
+                raise IndexError("Could not find Nasdaq 100 table with expected columns and row count.")
+            ticker_col, name_col = None, None
+            possible_ticker_cols = ['Ticker Symbol', 'Ticker', 'Symbol']
+            possible_name_cols = ['Company', 'Security']
+            for col in nasdaq_table.columns:
+                col_str = str(col)
+                if col_str in possible_ticker_cols and ticker_col is None:
+                    ticker_col = col_str
+                if col_str in possible_name_cols and name_col is None:
+                    name_col = col_str
+            if not ticker_col or not name_col:
+                logging.error(f"Could not find Nasdaq 100 columns (looked for {possible_ticker_cols} and {possible_name_cols}). Found: {nasdaq_table.columns.tolist()}")
+                return None
+            scraped_ticker_map = {}
+            for _, row in nasdaq_table.iterrows():
+                ticker_val, name_val = row.get(ticker_col), row.get(name_col)
+                if isinstance(ticker_val, str) and isinstance(name_val, str) and ticker_val.strip() and name_val.strip():
+                    ticker_clean = ticker_val.strip().replace('.', '-')
+                    name_lower = name_val.strip().lower()
+                    name_cleaned = re.sub(r'\s+(inc|incorporated|corp|corporation|ltd|plc|co)\.?\b|\.$|,', '', name_lower, flags=re.IGNORECASE).strip()
+                    scraped_ticker_map[name_lower] = ticker_clean
+                    if name_cleaned != name_lower and name_cleaned not in scraped_ticker_map:
+                        scraped_ticker_map[name_cleaned] = ticker_clean
+            ticker_map = scraped_ticker_map
+            logging.info(f"Scraped {len(ticker_map)} Nasdaq 100 entries.")
+        except requests.exceptions.RequestException as e:
+            logging.error(f"FATAL: Error fetching Nasdaq 100 URL '{url}': {e}")
+            return None
+        except Exception as e:
+            logging.error(f"FATAL: Unexpected error during Nasdaq 100 fetch: {e}", exc_info=True)
+            return None
+    if ticker_map is not None:
+        # Expanded overrides for top 50 stocks and Apple
+        overrides = {
+            # Apple-specific mappings
+            "apple": "AAPL", "apple inc": "AAPL", "apple inc.": "AAPL",
+            # Top 50 stocks by market cap (approximated based on recent data)
+            "microsoft": "MSFT", "microsoft corporation": "MSFT",
+            "nvidia": "NVDA", "nvidia corporation": "NVDA",
+            "amazon": "AMZN", "amazon.com": "AMZN",
+            "meta": "META", "meta platforms": "META", "facebook": "META",
+            "alphabet": "GOOGL", "google": "GOOGL", "alphabet class c": "GOOG",
+            "tesla": "TSLA", "tesla inc": "TSLA",
+            "berkshire hathaway": "BRK-B", "berkshire hathaway inc": "BRK-B",
+            "jpmorgan chase": "JPM", "jpmorgan chase & co": "JPM",
+            "visa": "V", "visa inc": "V",
+            "walmart": "WMT", "walmart inc": "WMT",
+            "exxon mobil": "XOM", "exxon mobil corporation": "XOM",
+            "unitedhealth group": "UNH", "unitedhealth group incorporated": "UNH",
+            "mastercard": "MA", "mastercard incorporated": "MA",
+            "procter & gamble": "PG", "procter & gamble company": "PG",
+            "johnson & johnson": "JNJ",
+            "home depot": "HD", "home depot inc": "HD",
+            "costco wholesale": "COST", "costco wholesale corporation": "COST",
+            "abbvie": "ABBV", "abbvie inc": "ABBV",
+            "chevron": "CVX", "chevron corporation": "CVX",
+            "merck": "MRK", "merck & co inc": "MRK",
+            "coca-cola": "KO", "coca-cola company": "KO",
+            "pepsico": "PEP", "pepsico inc": "PEP",
+            "broadcom": "AVGO", "broadcom inc": "AVGO",
+            "thermo fisher scientific": "TMO", "thermo fisher scientific inc": "TMO",
+            "cisco systems": "CSCO", "cisco": "CSCO",
+            "accenture": "ACN", "accenture plc": "ACN",
+            "mcdonald's": "MCD", "mcdonald's corporation": "MCD",
+            "pfizer": "PFE", "pfizer inc": "PFE",
+            "salesforce": "CRM", "salesforce inc": "CRM",
+            "bank of america": "BAC", "bank of america corporation": "BAC",
+            "netflix": "NFLX", "netflix inc": "NFLX",
+            "adobe": "ADBE", "adobe inc": "ADBE",
+            "advanced micro devices": "AMD", "amd": "AMD",
+            "linde": "LIN", "linde plc": "LIN",
+            "qualcomm": "QCOM", "qualcomm incorporated": "QCOM",
+            "intel": "INTC", "intel corporation": "INTC",
+            "wells fargo": "WFC", "wells fargo & company": "WFC",
+            "oracle": "ORCL", "oracle corporation": "ORCL",
+            "applied materials": "AMAT", "applied materials inc": "AMAT",
+            "union pacific": "UNP", "union pacific corporation": "UNP",
+            "texas instruments": "TXN", "texas instruments incorporated": "TXN",
+            "at&t": "T", "at&t inc": "T",
+            "verizon communications": "VZ", "verizon": "VZ",
+            "morgan stanley": "MS", "morgan stanley": "MS",
+            "goldman sachs": "GS", "goldman sachs group inc": "GS",
+            "comcast": "CMCSA", "comcast corporation": "CMCSA",
+            "charles schwab": "SCHW", "charles schwab corporation": "SCHW",
+            "intuit": "INTU", "intuit inc": "INTU",
+            "amgen": "AMGN", "amgen inc": "AMGN",
+            "paypal": "PYPL", "paypal holdings": "PYPL"
+        }
+        ticker_map.update(overrides)
+        logging.info(f"Nasdaq 100 map updated with {len(overrides)} overrides, total size: {len(ticker_map)}.")
+        if not loaded_from_cache or force_refresh:
+            try:
+                pd.to_pickle({'timestamp': time.time(), 'ticker_map': ticker_map}, cache_file)
+                logging.info(f"Saved Nasdaq 100 map to cache.")
+            except Exception as e:
+                logging.warning(f"Warning: Could not write Nasdaq 100 cache: {e}")
+    else:
+        logging.error("ERROR: Nasdaq 100 Ticker map is None.")
+        return None
+    return ticker_map
+
+# ... (rest of the script remains unchanged) ...
+
+# ... (rest of the script remains unchanged) ...
 
 def build_nasdaq100_ticker_map(cache_duration_hours=24, force_refresh=False):
     """Builds or loads a mapping of Nasdaq 100 company names to tickers from Wikipedia."""
@@ -1782,7 +2036,7 @@ def get_ticker_from_combined_map(query, combined_map):
             # Also try cleaned version of the tricky output name if the direct map hit didn't work
             tricky_out_cleaned = re.sub(r'\s+(inc|incorporated|corp|corporation|ltd|plc|co)\.?\b|\.$|,', '', tricky_out, flags=re.IGNORECASE).strip()
             if tricky_out_cleaned != tricky_out:
-                 ticker = combined_map.get(tricky_out_cleaned)
+                 ticker = combined_map.get(tricky_out_cleaned) # FIX: Typo here, was trcky_out_cleaned, changed to tricky_out_cleaned
                  if ticker: logging.debug(f"Combined map specific trick + cleaned hit for '{query_lower}' -> '{tricky_out_cleaned}': {ticker}"); return ticker
 
 
@@ -1812,123 +2066,99 @@ def load_combined_ticker_map():
     logging.info(" Combined Ticker Map Ready " + "="*30 + "\n");
     return combined_tickers
 
-@st.cache_data(ttl=3600) # Cache Yahoo search results for 1 hour
+@st.cache_data(ttl=3600)
 def lookup_ticker_by_company_name(query):
-    """Attempts to find a stock ticker for a given query (ticker or company name)."""
-    if not query or len(query.strip()) < 1: return None
-    search_term = query.strip(); logging.info(f"=== Starting Ticker Lookup for: '{search_term}' ===");
+    if not query or len(query.strip()) < 1:
+        return None
+    search_term = query.strip()
+    logging.info(f"=== Starting Ticker Lookup for: '{search_term}' ===")
 
-    # Step 1: Check if the query itself is a plausible ticker
-    direct_ticker_attempt = search_term.upper().replace('$', '');
-    # A plausible ticker is 1-10 alphanumeric chars, allows hyphens/dots (for international/OTC),
-    # but filter out long strings that are only digits (unlikely tickers).
+    # Step 1: Direct Ticker Check
+    direct_ticker_attempt = search_term.upper().replace('$', '')
     is_potential_ticker = bool(re.fullmatch(r'[A-Z0-9\-\.]{1,10}', direct_ticker_attempt)) and not (direct_ticker_attempt.isdigit() and len(direct_ticker_attempt) > 4)
-
     if is_potential_ticker:
         logging.info(f"Step 1: Query '{search_term}' looks like ticker '{direct_ticker_attempt}'. Direct yf check...")
         try:
-            # Use a quick history check as info() can be slow or fail on invalid symbols
-            ticker_obj = yf.Ticker(direct_ticker_attempt);
-            # Check history for the last day - if it exists, it's likely a valid symbol
-            hist = ticker_obj.history(period="1d", interval="1d")
-            if not hist.empty:
-                # Optional: Check info to filter out non-EQUITY/ETF if needed, but history is strong validation
-                # info = ticker_obj.info # Could add this back if stricter filtering is desired
-                # if info and info.get('quoteType') and info.get('quoteType') not in ['EQUITY', 'ETF']:
-                #      logging.info(f"Step 1 FAILED: Ticker '{direct_ticker_attempt}' exists but not supported type (Type: {info.get('quoteType')}).")
-                #      # Fall through to next steps
-                # else:
-                logging.info(f"Step 1 SUCCESS (via history): Direct yf '{direct_ticker_attempt}' confirmed (history found)."); return direct_ticker_attempt.upper()
-            else:
-                 logging.info(f"Step 1 FAILED: Direct yf check '{direct_ticker_attempt}' - no history.")
-                 # Fall through to next steps
+            hist = get_ticker_history(direct_ticker_attempt)
+            logging.info(f"Step 1 SUCCESS (via history): Direct yf '{direct_ticker_attempt}' confirmed (history found).")
+            return direct_ticker_attempt.upper()
         except Exception as e:
-             # Catch exceptions during yf.Ticker or history call
-             logging.warning(f"Step 1 EXCEPTION: Direct yf check failed for '{direct_ticker_attempt}': {e}.")
-             # Fall through to next steps
-    else: logging.info(f"Step 1: Query '{search_term}' not formatted like ticker.")
+            logging.warning(f"Step 1 EXCEPTION: Direct yf check failed for '{direct_ticker_attempt}': {e}.")
 
-    # Step 2: Check Combined S&P/Nasdaq Map
+    # Step 2: Combined S&P/Nasdaq Map
     logging.info(f"Step 2: Checking Combined S&P/Nasdaq Map for '{search_term}'...")
     map_ticker = get_ticker_from_combined_map(search_term, COMBINED_TICKERS)
     if map_ticker:
-         # Verify the map result with yfinance history as a safety check
-         try:
-             yf_map_ticker = yf.Ticker(map_ticker)
-             hist_map = yf_map_ticker.history(period="1d", interval="1d")
-             if not hist_map.empty:
-                 logging.info(f"Step 2 SUCCESS: Found '{search_term}' in Combined Map: {map_ticker}, yf history confirmed.");
-                 # Optional: Filter out non-EQUITY/ETF from map results too
-                 # info_map = yf_map_ticker.info
-                 # if info_map and info_map.get('quoteType', '').upper() not in ['EQUITY', 'ETF']:
-                 #      logging.warning(f"Map result {map_ticker} is not EQUITY/ETF (Type: {info_map.get('quoteType')}). Continuing lookup.")
-                 #      # Fall through to step 3
-                 # else:
-                 return map_ticker.upper()
-             else:
-                 logging.warning(f"Step 2 FAILED: Map result '{map_ticker}' from '{search_term}' not confirmed by yf history.")
-                 # Fall through to step 3
-         except Exception as e:
-              logging.warning(f"Step 2 EXCEPTION: yf check on map result '{map_ticker}' failed: {e}.")
-              # Fall through to step 3
-    else: logging.info(f"Step 2 FAILED: Query '{search_term}' not in combined map.")
+        try:
+            hist_map = get_ticker_history(map_ticker)
+            logging.info(f"Step 2 SUCCESS: Found '{search_term}' in Combined Map: {map_ticker}, yf history confirmed.")
+            return map_ticker.upper()
+        except Exception as e:
+            logging.warning(f"Step 2 EXCEPTION: yf check on map result '{map_ticker}' failed: {e}.")
+    else:
+        logging.info(f"Step 2 FAILED: Query '{search_term}' not in combined map.")
 
-    # Step 3: Fallback to Yahoo Finance Search API
+    # Step 3: Yahoo Finance Search API
     logging.info(f"Step 3: Falling back to Yahoo Finance Search API for '{search_term}'...")
     try:
-        matches = yf.utils.get_json("https://query1.finance.yahoo.com/v1/finance/search", params={"q": search_term});
+        matches = yahoo_finance_search(search_term)
         quotes = matches.get("quotes", [])
-        if not quotes: logging.info(f"Step 3 FAILED: No matches in Yahoo search."); return None
-
-        best_match = None; highest_score = -1; search_term_lower = search_term.lower()
-
-        # Define allowed quote types and exchanges more explicitly
+        if not quotes:
+            logging.info(f"Step 3 FAILED: No matches in Yahoo search.")
+            return None
+        best_match = None
+        highest_score = -1
+        search_term_lower = search_term.lower()
         allowed_quote_types = ["EQUITY", "ETF"]
-        # Add common major exchanges suffix or exchDisp
-        allowed_exchanges_suffix = ['.TA', '.TL', '.AS', '.BR', '.DE', '.PA', '.L', '.TO', '.V', '.HE', '.SW'] # TA, TLV, Euronext, XTRA, PAR, LSE, TSX, TSXV, HEX, EBS
-        allowed_exchanges_disp = ["TLV", "TASE", "NMS", "NYQ", "ASE", "AMS", "BRU", "GER", "PAR", "LSE", "TOR", "VAN", "HEL", "EBS"] # Nasdaq, NYSE, Amex, Euronext etc.
-
+        allowed_exchanges_suffix = ['.TA', '.TL', '.AS', '.BR', '.DE', '.PA', '.L', '.TO', '.V', '.HE', '.SW']
+        allowed_exchanges_disp = ["TLV", "TASE", "NMS", "NYQ", "ASE", "AMS", "BRU", "GER", "PAR", "LSE", "TOR", "VAN", "HEL", "EBS"]
         for item in quotes:
-            symbol = item.get("symbol"); quote_type = item.get("quoteType"); score = item.get("score", 0) or 0; # Use 0 if score is None
-            short_name = item.get("shortname", "").lower(); long_name = item.get("longname", "").lower(); exch_disp = item.get("exchDisp", "")
-            is_yahoo_finance = item.get("isYahooFinance", False) # Prioritize results flagged as primary
-
-            # Basic filters: Valid symbol, allowed type, not an index/future/option/currency
+            symbol = item.get("symbol")
+            quote_type = item.get("quoteType")
+            score = item.get("score", 0) or 0
+            short_name = item.get("shortname", "").lower()
+            long_name = item.get("longname", "").lower()
+            exch_disp = item.get("exchDisp", "")
+            is_yahoo_finance = item.get("isYahooFinance", False)
             if not symbol or quote_type not in allowed_quote_types or '^' in symbol or any(ft in quote_type.upper() for ft in ['FUTURE', 'INDEX', 'CURRENCY', 'OPTION', 'MUTUALFUND']):
-                 logging.debug(f"Step 3 Filtered (Type/Symbol): {symbol} ({quote_type})"); continue
-
-            # Exchange filter: must be a US exchange or one of the explicitly allowed international ones
+                logging.debug(f"Step 3 Filtered (Type/Symbol): {symbol} ({quote_type})")
+                continue
             if '.' in symbol:
-                 suffix = '.' + symbol.split('.')[-1].upper()
-                 if suffix not in allowed_exchanges_suffix and exch_disp not in allowed_exchanges_disp:
-                      logging.debug(f"Step 3 Filtered (Exchange Suffix/Disp: {suffix}/{exch_disp}): {symbol}"); continue
-            elif exch_disp not in ["NMS", "NYQ", "ASE", "NASDAQ", "NYSE", "AMEX", "BATS"]: # Assume US exchange if no dot, check common US displays
-                 logging.debug(f"Step 3 Filtered (US Exchange Disp: {exch_disp}): {symbol}"); continue
-
-
-            # Calculate a relevance score
-            current_score = score # Start with Yahoo's score
-            if search_term_lower == short_name: current_score += 1000 # Exact name match is very high
-            elif search_term_lower == long_name: current_score += 500
-            # Partial matches - penalize shorter query matches in longer names
-            if short_name and search_term_lower in short_name: current_score += (len(search_term_lower) / len(short_name)) * 100
-            elif long_name and search_term_lower in long_name: current_score += (len(search_term_lower) / len(long_name)) * 50
-            # Give bonus for exact ticker match
-            if search_term_lower.upper() == symbol.upper(): current_score += 200
-            # Bonus for primary Yahoo Finance listing
-            if is_yahoo_finance: current_score += 10
-
+                suffix = '.' + symbol.split('.')[-1].upper()
+                if suffix not in allowed_exchanges_suffix and exch_disp not in allowed_exchanges_disp:
+                    logging.debug(f"Step 3 Filtered (Exchange Suffix/Disp: {suffix}/{exch_disp}): {symbol}")
+                    continue
+            elif exch_disp not in ["NMS", "NYQ", "ASE", "NASDAQ", "NYSE", "AMEX", "BATS"]:
+                logging.debug(f"Step 3 Filtered (US Exchange Disp: {exch_disp}): {symbol}")
+                continue
+            current_score = score
+            if search_term_lower == short_name:
+                current_score += 1000
+            elif search_term_lower == long_name:
+                current_score += 500
+            if short_name and search_term_lower in short_name:
+                current_score += (len(search_term_lower) / len(short_name)) * 100
+            elif long_name and search_term_lower in long_name:
+                current_score += (len(search_term_lower) / len(long_name)) * 50
+            if search_term_lower.upper() == symbol.upper():
+                current_score += 200
+            if is_yahoo_finance:
+                current_score += 10
             logging.debug(f"Step 3 Candidate: {symbol} ({quote_type}, {exch_disp}), Score: {current_score:.2f}, Names: '{short_name}'/'{long_name}'")
-
             if current_score > highest_score:
-                highest_score = current_score; best_match = symbol
-
-        if best_match: logging.info(f"Step 3 SUCCESS: Best match from Fallback Search (Score: {highest_score:.2f}): {best_match}"); return best_match.upper()
-        else: logging.info(f"Step 3 FAILED: No suitable EQUITY/ETF found via Fallback Search."); return None
-
-    except Exception as e: logging.warning(f"Step 3 EXCEPTION: Fallback search failed: {e}", exc_info=False); return None # Don't log stack trace for common search errors
-
-    finally: logging.info(f"=== Finished Ticker Lookup for: '{search_term}' ===")
+                highest_score = current_score
+                best_match = symbol
+        if best_match:
+            logging.info(f"Step 3 SUCCESS: Best match from Fallback Search (Score: {highest_score:.2f}): {best_match}")
+            return best_match.upper()
+        else:
+            logging.info(f"Step 3 FAILED: No suitable EQUITY/ETF found via Fallback Search.")
+            return None
+    except Exception as e:
+        logging.warning(f"Step 3 EXCEPTION: Fallback search failed: {e}")
+        return None
+    finally:
+        logging.info(f"=== Finished Ticker Lookup for: '{search_term}' ===")
 
 
 # --- Load Combined Ticker Map ---
@@ -1937,27 +2167,6 @@ COMBINED_TICKERS = load_combined_ticker_map()
 # --- Chat Management ---
 if "messages" not in st.session_state: st.session_state.messages = []
 if "predefined_question" not in st.session_state: st.session_state.predefined_question = None
-
-# --- UI Elements ---
-# Updated Title
-st.markdown('<h1 style="text-align: left;">📈 Financial Chat, Risk Score, News & Forecasting</h1>', unsafe_allow_html=True)
-# Updated description
-st.markdown(f'<p style="text-align: left; font-size: small;">Ask about stocks ($AAPL, Microsoft), compare, or discuss finance. Includes Dynamic Risk Score, Recent News Sentiment (Multi-Source/{NEWS_DAYS_BACK}d/VADER), and ETS Price Forecasting (Calculated). No charts or technical scans.</p>', unsafe_allow_html=True)
-
-with st.sidebar:
-    st.image("https://streamlit.io/images/brand/streamlit-mark-color.png", width=50)
-    st.markdown("## Examples")
-    # Updated MENU_OPTIONS - removed Scan Signals
-    MENU_OPTIONS = {
-        "🔍 Stock Info": ["What's up with $TSLA?", "Tell me about Apple", "Info on Coca-Cola?", "$ESLT.TA details", "Microsoft data?", "3M Company info?"],
-        "📊 TA Concepts": ["What is SMA?", "Explain Moving Averages?", "What is Support/Resistance?", "Candlesticks?", "What are technical indicators?"], # Kept TA concepts
-        "⚖️ Risk": ["What's the risk score for $AMD?", "Explain the risk score model", "How risky is $TQQQ?", "Risk for GOOG?"],
-        "📰 News Sentiment": ["News sentiment for $MSFT?", "Recent news sentiment for $NVDA?", "Sentiment analysis for META?"],
-        "📈 ETS Forecast": ["Forecast $AAPL price", "What's the ETS forecast for $MSFT?", "Price projection for $GOOG?"],
-        "💼 Portfolio": ["How to diversify?", "Risks of single stocks?"],
-        "📰 Market/General": ["Impact of interest rates?", "Inflation effect?", "What are ETFs?"],
-    }
-    # ... (previous code before the sidebar section) ...
 
 # --- UI Elements ---
 # Updated Title
@@ -1978,49 +2187,19 @@ with st.sidebar:
         "💼 Portfolio": ["How to diversify?", "Risks of single stocks?"],
         "📰 Market/General": ["Impact of interest rates?", "Inflation effect?", "What are ETFs?"],
     }
-
-    # --- ADD THIS LINE ---
-    button_counter = 0
-    # --- End Add ---
-
     for category, questions in MENU_OPTIONS.items():
         # Expanded default categories adjusted
         is_expanded = (category in ["🔍 Stock Info", "⚖️ Risk", "📰 News Sentiment", "📈 ETS Forecast"])
         with st.expander(f"**{category}**", expanded=is_expanded):
             for i, q in enumerate(questions):
-                # REMOVE or COMMENT OUT THIS OLD LINE:
-                # safe_category = re.sub(r'\W+', '', category); button_key = f"menu_{safe_category}_{i}"
+                safe_category = re.sub(r'\W+', '', category); button_key = f"menu_{safe_category}_{i}"
+                if st.button(q, key=button_key, use_container_width=True): st.session_state.predefined_question = q; st.rerun() # Use st.rerun()
 
-                # --- ADD THESE TWO LINES ---
-                button_counter += 1
-                button_key = f"menu_example_question_button_{button_counter}" # Assign the key using the counter
-                # --- End Add ---
+    st.caption("Click a question to ask."); st.divider(); st.info("Enter a ticker symbol ($GOOGL) or company name (Microsoft, 3M) for specific data."); st.divider()
 
-                # The check below is now less necessary as the counter guarantees uniqueness
-                # if button_key in st.session_state:
-                #     logging.error(f"FATAL: Duplicate button key '{button_key}' detected!")
-
-                if st.button(q, key=button_key, use_container_width=True):
-                    st.session_state.predefined_question = q
-                    st.rerun()
-
-            # --- REMOVE the following three lines from HERE ---
-            # st.caption("Click a question to ask.");
-            # st.divider();
-            # st.info("Enter a ticker symbol ($GOOGL) or company name (Microsoft, 3M) for specific data.");
-            # st.divider() # This last divider was outside the loop originally, move it too.
-            # --- End REMOVE ---
-
-    # --- ADD the lines here, after the loops ---
-    st.caption("Click a question to ask.")
-    st.divider()
-    st.info("Enter a ticker symbol ($GOOGL) or company name (Microsoft, 3M) for specific data.")
-    st.divider() # This divider should also be here
-    # --- End Add ---
-
-# ... (rest of the code, including the rest of the sidebar) ...
     # Display API Key warnings in sidebar
-    if not RISKFOLIO_AVAILABLE: st.warning("Riskfolio-Lib not found. Some advanced risk factors/methods disabled.", icon="⚠️")
+    # Riskfolio is no longer used, so no need to warn about it
+    # if not RISKFOLIO_AVAILABLE: st.warning("Riskfolio-Lib not found. Some advanced risk factors/methods disabled.", icon="⚠️")
     # API key checks are done at the start, assuming they stop the app if critical keys are missing/invalid.
     # Optional: Display warnings here if keys *were* provided but were invalid, if the app didn't stop.
     # For now, relying on the initial st.error and st.stop() is sufficient.
@@ -2032,9 +2211,13 @@ for msg in st.session_state.messages:
         st.markdown(str(msg["content"]), unsafe_allow_html=True)
 
 # --- Ticker Extraction ---
-# [extract_tickers function remains the same]
 # Added more common non-ticker words
-FORBIDDEN_TICKERS = {"TELL", "LOVE", "LIFE", "SOLO", "PLAY", "YOU", "REAL", "CASH", "WORK", "HOPE", "GOOD", "SAFE", "FAST", "COOK", "HUGE", "YOLO", "BOOM", "DUDE", "WISH", "ME", "ARE", "IS", "THE", "FOR", "AND", "NOW", "SEE", "CAN", "HAS", "WAS", "BUY", "SELL", "ALL", "ONE", "TWO", "BIG", "NEW", "OLD", "TOP", "LOW", "HIGH", "DATA", "FREE", "NEWS", "RISK", "CHART", "ETF", "FUND", "INDEX", "STOCK", "SHARES", "PRICE", "TRADE", "HOLD", "EXIT", "ENTRY"}
+FORBIDDEN_TICKERS = {"TELL", "LOVE", "LIFE", "SOLO", "PLAY", "YOU", "REAL", "CASH", "WORK", "HOPE", "GOOD", "SAFE", "FAST", "COOK", "HUGE", "YOLO", "BOOM", "DUDE", "WISH", "ME", "ARE", "IS", "THE", "FOR", "AND", "NOW", "SEE", "CAN", "HAS", "WAS", "BUY", "SELL", "ALL", "ONE", "TWO", "BIG", "NEW", "OLD", "TOP", "LOW", "HIGH", "DATA", "FREE", "NEWS", "RISK", "CHART", "ETF", "FUND", "INDEX", "STOCK", "SHARES", "PRICE", "TRADE", "HOLD", "EXIT", "ENTRY","WHAT","ABOUT","ME","SENTIMENT","RISK","surge", "plunge", "spike", "dip", "correction", "crash", "rally", "breakout", "reversal", "pullback", "capital", "liquidity", "float", "burn rate", "runway", "dry powder",
+ "trade", "order", "fill", "execution", "volume", "spread", "slippage", "scalping",
+ "bullish", "bearish", "FOMO", "HODL", "panic sell", "greed", "fear",
+ "investor", "trader", "market maker", "broker", "institutional investor",
+ "drawdown", "stop-loss", "risk/reward", "volatility", "leverage",
+ "earnings", "PE ratio", "support", "resistance", "RSI", "MACD", "candlestick", "volume profile"}
 def extract_tickers(text):
     """Extracts potential ticker symbols (prefixed with $) or standalone words that might be tickers."""
     # Find words that look like tickers, potentially prefixed with $
@@ -2183,34 +2366,35 @@ if user_input_triggered:
 
                 # 2. Fetch Unified Yahoo History (Needed for Risk & ETS)
                 placeholder.markdown(f"⏳ Fetching Yahoo Finance history (for Risk/ETS) for **{primary_ticker}**...")
-                # Fetch 3 years of history
+                # Fetch 3 years of history (needed for some potential factors and ETS)
                 close_prices_history_yf, full_history_df_yf = get_unified_yfinance_history(primary_ticker, period="3y")
                 if full_history_df_yf is None or full_history_df_yf.empty:
-                     logging.warning(f"Unified Yahoo history fetch failed or empty for {primary_ticker}. Risk & ETS will be unavailable.")
+                     logging.warning(f"Unified Yahoo history fetch failed or empty for {primary_ticker}. Risk & ETS might be unavailable.")
                 else:
                      logging.info(f"Unified Yahoo history fetch OK for {primary_ticker} ({len(full_history_df_yf)} rows).")
 
 
-                # 3. Calculate Risk Score (Uses full Yahoo history df)
+                # 3. Calculate Risk Score (Uses full Yahoo history df and info)
                 placeholder.markdown(f"⏳ Calculating Dynamic Risk Score for **{primary_ticker}**...")
                 intermediate_risk_scores = {}; factors_weight_sum = 0.0
-                # Check if Yahoo history is available for risk calculation
-                if full_history_df_yf is not None and not full_history_df_yf.empty:
+                # Pass both history df and info dict to the simplified risk score function
+                if full_history_df_yf is not None and not full_history_df_yf.empty and stock_data is not None:
                     try:
-                         # Pass the full OHLCV df from Yahoo history to the risk score function
-                         risk_score_final, intermediate_risk_scores, factors_weight_sum = calculate_dynamic_risk_score(primary_ticker, full_history_df_yf, weights=DEFAULT_WEIGHTS)
+                         risk_score_final, intermediate_risk_scores, factors_weight_sum = calculate_dynamic_risk_score(primary_ticker, full_history_df_yf, stock_data, weights=DEFAULT_WEIGHTS)
                     except Exception as risk_err:
-                         logging.error(f"Error calling risk calc for {primary_ticker}: {risk_err}", exc_info=True)
+                         logging.error(f"Error calling simplified risk calc for {primary_ticker}: {risk_err}", exc_info=True)
                          risk_score_final = None # Ensure score is None on error
 
-                if risk_score_final is not None:
+                if risk_score_final is not None and pd.notna(risk_score_final): # Check for pd.notna here too
                     risk_category = get_risk_category(risk_score_final)
                     risk_score_description = f"Risk Score (Model): {risk_score_final:.2f}/100 ({risk_category})"
                     logging.info(f"Risk score OK: {risk_score_description}.")
                 else:
-                    risk_score_description = f"Risk Score (Model): Could not calculate for {primary_ticker} (Insufficient history or data error).";
+                    risk_score_description = f"Risk Score (Model): Could not calculate for {primary_ticker} (Insufficient history, data errors, or factors unavailable).";
                     risk_category = "N/A"
-                    logging.warning(f"Risk score calc returned None for {primary_ticker}.")
+                    logging.warning(f"Simplified risk score calc returned None/NaN for {primary_ticker} or input data invalid.")
+                    # Show a toast if risk score failed specifically for this ticker
+                    st.toast(f"⚠️ Risk score unavailable for {primary_ticker}. Requires historical price data and basic info.", icon="⚠️")
 
 
                 # 4. Fetch Polygon.io data and Calculate Trading Signals
@@ -2236,8 +2420,8 @@ if user_input_triggered:
                     logging.warning(f"Polygon.io data fetch failed or empty for {primary_ticker}.")
 
                 # Check if signals are unavailable and show a toast
-                if "Unavailable" in trading_signals_summary or "Error" in trading_signals_summary or "failed" in trading_signals_summary.lower():
-                     st.toast(f"⚠️ Trading signals unavailable for {primary_ticker}.", icon="⚠️")
+                if "Unavailable" in trading_signals_summary or "Error" in trading_signals_summary or "failed" in trading_signals_summary.lower() or trading_signals_list == []:
+                     if primary_ticker: st.toast(f"⚠️ Trading signals unavailable for {primary_ticker}.", icon="⚠️")
 
 
                 # 5. Fetch Multi-Source News Sentiment
@@ -2250,17 +2434,21 @@ if user_input_triggered:
                     news_sentiment_summary = f"News Sentiment: Error during analysis for {primary_ticker}."
                     news_sentiment_counts_dict = {'positive': None, 'negative': None, 'neutral': None, 'total': None, 'avg_score': None}
                     news_articles_details = []
+                # Show toast if no news found
+                if news_sentiment_counts_dict.get('total', 0) == 0 and primary_ticker:
+                     st.toast(f"⚠️ No recent news found for {primary_ticker}.", icon="⚠️")
 
 
                 # 6. Generate ETS Forecast (Uses close_prices series from Yahoo history)
                 placeholder.markdown(f"⏳ Generating ETS Price Forecast for **{primary_ticker}**...")
                 forecast_days = 7 # Define forecast horizon
                 # Check if Yahoo close price history is available for forecasting
+                # Need enough data for ETS (min_data_required is checked inside the function)
                 if close_prices_history_yf is not None and not close_prices_history_yf.empty:
                     try:
                         # Pass the Close price series from Yahoo history to the forecast function
                         forecast_values, eval_metric_str, model_desc = forecast_stock_ets_advanced(primary_ticker, close_prices_history_yf, forecast_days=forecast_days)
-                        if forecast_values is not None:
+                        if forecast_values is not None and not forecast_values.empty:
                             forecast_lines = [f"- Forecast Period: Next {forecast_days} business days"]
                             forecast_lines.append(f"- Model Used: {model_desc}")
                             if eval_metric_str and "Error" not in eval_metric_str and "skipped" not in eval_metric_str.lower():
@@ -2288,6 +2476,10 @@ if user_input_triggered:
                 else:
                     ets_forecast_summary = f"ETS Price Forecast: Unavailable due to missing historical price data from Yahoo for {primary_ticker}.";
                     logging.warning(f"ETS forecast skipped for {primary_ticker} due to missing history.")
+
+                # Show toast if forecast failed
+                if "Unavailable" in ets_forecast_summary or "Error" in ets_forecast_summary or "Could not generate" in ets_forecast_summary:
+                     if primary_ticker: st.toast(f"⚠️ Price forecast unavailable for {primary_ticker}.", icon="⚠️")
 
 
             placeholder.markdown(f"⏳ Compiling info & generating response for **{primary_ticker}**...")
@@ -2384,7 +2576,7 @@ if user_input_triggered:
 
             # Display Data Dashboard AFTER response generation if a ticker was processed
             if primary_ticker and stock_data:
-                 # Ensure risk_category is correct for display even if risk_score_final was None
+                 # Ensure risk_category is correct for display even if risk_score_final was None or NaN
                  risk_category_display = get_risk_category(risk_score_final)
                  display_stock_data_dashboard(
                      stock_data,
@@ -2424,7 +2616,7 @@ if user_input_triggered:
 st.divider() # Divider before the donation link
 
 # --- Start of Donation Section ---
-st.caption("Like this tool? Consider supporting its development: [☕ Buy me a coffee (PayPal.me)](https://paypal.me/niveyal) (Optional, but appreciated!)")
+st.markdown('<p style="font-size: 16px; font-weight: bold; text-align: center;">Like this tool? Consider supporting its development: <a href="https://paypal.me/niveyal">☕ Buy me a coffee (PayPal.me)</a> (Optional, but appreciated!)</p>', unsafe_allow_html=True)
 # --- End of Donation Section ---
 
 st.divider() # Divider between donation and disclaimer
