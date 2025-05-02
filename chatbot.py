@@ -1965,7 +1965,7 @@ with st.sidebar:
                 # safe_category = re.sub(r'\W+', '', category); button_key = f"menu_{safe_category}_{i}"
                 if st.button(q, key=button_key, use_container_width=True): st.session_state.predefined_question = q; st.rerun() # Use st.rerun()
 
-    st.caption("Click a question to ask."); st.divider(); st.info("Enter a ticker symbol ($GOOGL) or company name (Microsoft, 3M) for specific data."); st.divider()
+                st.caption("Click a question to ask."); st.divider(); st.info("Enter a ticker symbol ($GOOGL) or company name (Microsoft, 3M) for specific data."); st.divider()
 
     # Display API Key warnings in sidebar
     if not RISKFOLIO_AVAILABLE: st.warning("Riskfolio-Lib not found. Some advanced risk factors/methods disabled.", icon="⚠️")
