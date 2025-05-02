@@ -2070,11 +2070,16 @@ def lookup_ticker_by_company_name(query):
         # assuming the search API is somewhat reliable for EQUITY/ETF types.
         logging.info(f"Step 3 SUCCESS: Found match '{fallback_match}' via Fallback Search.")
         return fallback_match.upper()
-    else:
-        logging.info(f"Step 3 FAILED: No suitable match found via Fallback Search.")
-        return None
+    try:
+        if fallback_match:
+            logging.info(f"Step 3 SUCCESS: Found match '{fallback_match}' via Fallback Search.")
+            return fallback_match.upper()
+        else:
+            logging.info("Step 3 FAILED: No suitable match found via Fallback Search.")
+            return None
+    finally:
+        logging.info(f"=== Finished Ticker Lookup for: '{search_term}' ===")
 
-    finally: logging.info(f"=== Finished Ticker Lookup for: '{search_term}' ===")
 
 
 # --- Load Combined Ticker Map ---
