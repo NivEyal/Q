@@ -1,0 +1,12 @@
+streamlit
+yfinance
+pandas
+praw
+vaderSentiment
+lxml
+riskfolio-lib
+vaderSentiment 
+feedparser
+openai
+polygon
+polygon-api-client
