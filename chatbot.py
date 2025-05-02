@@ -2110,11 +2110,14 @@ def lookup_ticker_by_company_name(query):
     # Step 3: Fallback to Yahoo Finance Search API
     logging.info(f"Step 3: Falling back to Yahoo Finance Search API for '{search_term}'...")
     try:
-        matches = yf.utils.get_json("https://query1.finance.yahoo.com/v1/finance/search", params={"q": search_term});
-        quotes = matches.get("quotes", [])
+        res = requests.get("https://query1.finance.yahoo.com/v1/finance/search", params={"q": search_term}, timeout=10)
+        quotes = res.json().get("quotes", [])
         if not quotes: logging.info(f"Step 3 FAILED: No matches in Yahoo search."); return None
 
         best_match = None; highest_score = -1; search_term_lower = search_term.lower()
+    except Exception as e:
+        logging.warning(f"Step 3 EXCEPTION: {e}")
+        return None    
 
         # Define allowed quote types and exchanges more explicitly
         allowed_quote_types = ["EQUITY", "ETF"]
