@@ -2107,18 +2107,21 @@ def lookup_ticker_by_company_name(query):
               # Fall through to step 3
     else: logging.info(f"Step 2 FAILED: Query '{search_term}' not in combined map.")
 
-    # Step 3: Fallback to Yahoo Finance Search API
-    logging.info(f"Step 3: Falling back to Yahoo Finance Search API for '{search_term}'...")
+    
+# Step 3: Fallback to Yahoo Finance Search API
+import requests
+def fallback_yahoo_search(search_term):
     try:
         res = requests.get("https://query1.finance.yahoo.com/v1/finance/search", params={"q": search_term}, timeout=10)
+        res.raise_for_status()
         quotes = res.json().get("quotes", [])
-        if not quotes: logging.info(f"Step 3 FAILED: No matches in Yahoo search."); return None
-
-        best_match = None; highest_score = -1; search_term_lower = search_term.lower()
+        for quote in quotes:
+            if quote.get("quoteType") in ["EQUITY", "ETF"]:
+                return quote.get("symbol")
+        return None
     except Exception as e:
         logging.warning(f"Step 3 EXCEPTION: {e}")
-        return None    
-
+        return None
         # Define allowed quote types and exchanges more explicitly
         allowed_quote_types = ["EQUITY", "ETF"]
         # Add common major exchanges suffix or exchDisp
@@ -2129,7 +2132,7 @@ def lookup_ticker_by_company_name(query):
             symbol = item.get("symbol"); quote_type = item.get("quoteType"); score = item.get("score", 0) or 0; # Use 0 if score is None
             short_name = item.get("shortname", "").lower(); long_name = item.get("longname", "").lower(); exch_disp = item.get("exchDisp", "")
             is_yahoo_finance = item.get("isYahooFinance", False) # Prioritize results flagged as primary
-
+            
             # Basic filters: Valid symbol, allowed type, not an index/future/option/currency
             if not symbol or quote_type not in allowed_quote_types or '^' in symbol or any(ft in quote_type.upper() for ft in ['FUTURE', 'INDEX', 'CURRENCY', 'OPTION', 'MUTUALFUND']):
                  logging.debug(f"Step 3 Filtered (Type/Symbol): {symbol} ({quote_type})"); continue
