@@ -23,6 +23,10 @@ import json
 from collections import Counter
 import sys
 import warnings
+# --- Added imports for Rate Limiting ---
+from functools import wraps
+import requests.exceptions
+
 
 import openai  # ✅ MAKE SURE THIS LINE IS PRESENT!
 
@@ -112,11 +116,12 @@ POLYGON_HISTORY_CACHE_DURATION_SECONDS = 300 # Cache Polygon history for 5 mins
 # you might need to set these as environment variables or load differently.
 # For Streamlit Cloud deployment, secrets.toml is the standard.
 try:
+    logging.info("Attempting to load API keys from secrets.toml...")
     OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
     NEWS_API_KEY = st.secrets["NEWS_API_KEY"]
     FMP_API_KEY = st.secrets["FMP_API_KEY"]
     POLYGON_API_KEY = st.secrets["POLYGON_API_KEY"]
-    logging.info("Attempted loading API keys from secrets.toml.")
+    logging.info("Successfully attempted loading API keys from secrets.toml.")
 except FileNotFoundError:
     logging.error("secrets.toml not found. Attempting to load from environment variables.")
     OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
@@ -296,26 +301,153 @@ def parse_date(date_string):
         logging.debug(f"Could not parse date: {date_string}")
         return None
 
+# --- Rate Limiting Decorator ---
+# Apply this decorator to Yahoo Finance functions that might hit rate limits
+def rate_limit_retry(max_attempts=3, initial_delay=5): # Increased initial delay as suggested
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            attempts = 0
+            delay = initial_delay
+            while attempts < max_attempts:
+                try:
+                    return func(*args, **kwargs)
+                except (requests.exceptions.HTTPError, requests.exceptions.RequestException) as e:
+                    # Catch specific requests exceptions for HTTP errors
+                    status_code = getattr(e.response, 'status_code', None)
+                    error_message = str(e)
+
+                    is_rate_limit = (status_code == 429 or "Too Many Requests" in error_message)
+
+                    if is_rate_limit:
+                        attempts += 1
+                        if attempts == max_attempts:
+                            logging.error(f"Rate limit hit for {func.__name__}, exhausting retries ({attempts}/{max_attempts}). Last error: {error_message}")
+                            raise # Re-raise after max attempts
+                        logging.warning(f"Rate limit hit for {func.__name__}, retrying after {delay}s (attempt {attempts}/{max_attempts}). Status: {status_code} Msg: {error_message[:100]}...")
+                        time.sleep(delay)
+                        delay *= 2  # Exponential backoff
+                        # Add jitter (optional but good practice)
+                        delay += np.random.uniform(0, initial_delay * 0.5)
+                    else:
+                        # Re-raise if it's not a rate limit error
+                        logging.error(f"Non-rate limit error in {func.__name__} (attempt {attempts+1}/{max_attempts}): {e}")
+                        raise
+                except Exception as e:
+                    # Catch any other unexpected exceptions
+                    logging.error(f"Unexpected error in {func.__name__} (attempt {attempts+1}/{max_attempts}): {e}", exc_info=True)
+                    # Decide if these should be retried. For YF, maybe not unless it's clearly transient.
+                    # For now, we'll just re-raise after logging. If you want to retry *any* exception, move
+                    # the retry logic outside the specific requests.exceptions catch.
+                    raise
+            # This part should theoretically not be reached if max_attempts is reached,
+            # as the exception is re-raised inside the loop.
+            logging.error(f"Reached end of retry loop for {func.__name__} unexpectedly.")
+            raise Exception(f"Failed after {max_attempts} attempts due to unexpected logic.")
+        return wrapper
+    return decorator
+
+# --- Decorated Yahoo Finance functions ---
+# Decorate the core functions that might hit rate limits
+@st.cache_data(ttl=300) # Keep caching, apply retry decorator *around* the fetch
+@rate_limit_retry(max_attempts=3, initial_delay=5)
+def get_stock_data_yf_retry(ticker):
+    """Fetches yfinance info with retries."""
+    logging.info(f"Attempting yfinance info fetch for {ticker}")
+    yf_ticker = ticker.replace('$', '').upper()
+    ticker_obj = yf.Ticker(yf_ticker)
+    info = ticker_obj.info
+    # Basic check if info is valid - yfinance can return empty dict sometimes
+    if not info or not info.get('symbol'):
+         # Try a history fetch as a final check if info is sparse
+         logging.warning(f"Info sparse/invalid for {ticker}, attempting history check inside retry.")
+         hist = ticker_obj.history(period="1d")
+         if hist.empty:
+              logging.warning(f"History also empty for {ticker}. Likely invalid ticker.")
+              raise ValueError(f"No data found for ticker {ticker}") # Raise to indicate fetch failed
+         else:
+              logging.info(f"History found for {ticker}, info sparse.")
+              if not info: info = {}
+              if 'symbol' not in info: info['symbol'] = yf_ticker
+              if 'quoteType' not in info: info['quoteType'] = 'EQUITY' # Assume EQUITY if history exists
+              if info.get('currentPrice') is None and not hist.empty: info['currentPrice'] = hist['Close'].iloc[-1] # Patch price
+
+    logging.info(f"Successful yfinance info fetch for {ticker}.")
+    return info, ticker_obj # Return info and ticker object
+
+
+@st.cache_data(ttl=HISTORY_CACHE_DURATION_SECONDS)
+@rate_limit_retry(max_attempts=3, initial_delay=5)
+def get_unified_yfinance_history_retry(ticker: str, period="3y"):
+    """
+    Fetches Yahoo Finance history with retries for Risk Score & ETS Forecast.
+    Returns Close series for ETS and full OHLCV df for Risk Score factors.
+    """
+    logging.info(f"Attempting unified yfinance history fetch for {ticker}, period: {period}")
+    yf_ticker_obj = yf.Ticker(ticker)
+    df = yf_ticker_obj.history(period=period, interval="1d", auto_adjust=False)
+
+    if df is None or df.empty:
+         logging.warning(f"No data returned from yfinance history fetch for {ticker}.")
+         # Instead of returning None, raise an error so the retry decorator can handle it
+         # If retries are exhausted, the final error will be caught by the caller
+         raise ValueError(f"yfinance history data is empty for ticker {ticker}")
+
+    # Process the dataframe if fetch was successful
+    required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+    if not all(col in df.columns for col in required_cols):
+         missing_cols = [col for col in required_cols if col not in df.columns]
+         logging.warning(f"Missing required columns ({missing_cols}) in unified yfinance data for {ticker}. Found: {df.columns.tolist()}.")
+         if 'Close' not in df.columns:
+              logging.error(f"Unified yfinance history for {ticker} missing 'Close' column.")
+              raise ValueError(f"Missing 'Close' column in history for {ticker}") # Indicate fatal data issue
+         available_cols = [col for col in required_cols if col in df.columns]
+         df_processed = df[available_cols].copy() # Keep only available required columns
+    else:
+         df_processed = df[required_cols].copy()
+
+    if isinstance(df_processed.index, pd.DatetimeIndex) and df_processed.index.tz is not None:
+        try: df_processed.index = df_processed.index.tz_convert('America/New_York').tz_localize(None) # Convert and remove timezone
+        except Exception as tz_err: logging.warning(f"Unified yfinance index tz conversion failed: {tz_err}."); pass
+    elif not isinstance(df_processed.index, pd.DatetimeIndex): logging.warning(f"Unified yfinance index for {ticker} not DatetimeIndex.")
+
+    logging.info(f"Successful unified yfinance history fetch for {ticker} ({len(df_processed)} rows).")
+    return df_processed['Close'].copy(), df_processed # Return Close series and the potentially subsetted df
+
+
+# --- Apply decorator to VIX fetch as well ---
+@st.cache_data(ttl=VIX_CACHE_DURATION_SECONDS)
+@rate_limit_retry(max_attempts=3, initial_delay=3) # VIX is quick, maybe fewer retries/delay
+def _get_vix_close_retry():
+    """Fetches VIX close price with retries."""
+    logging.info("Attempting VIX (^VIX) history fetch...")
+    vix_ticker = yf.Ticker("^VIX")
+    vix_data = vix_ticker.history(period="5d", interval="1d")
+    if vix_data is None or vix_data.empty or 'Close' not in vix_data.columns:
+        logging.warning("No VIX data or Close column found.")
+        raise ValueError("VIX data is empty or missing Close column") # Raise error for retry
+    latest_close = vix_data['Close'].dropna().iloc[-1] if not vix_data['Close'].dropna().empty else None
+    if latest_close is None:
+         logging.warning("Latest VIX close price is NaN after dropna.")
+         raise ValueError("Latest VIX close price is NaN") # Raise error for retry
+    logging.info(f"Successful VIX fetch: {latest_close:.2f}")
+    return latest_close
+
+
 @st.cache_data(ttl=300)
 def get_stock_data(ticker):
-    logging.info(f"Fetching Yahoo Finance summary data for {ticker}")
+    """
+    Fetches Yahoo Finance summary data using the retry-decorated function.
+    Returns processed data dictionary or None.
+    """
     try:
-        yf_ticker = ticker.replace('$', '').upper(); logging.info(f"Requesting yfinance info for symbol: {yf_ticker}")
-        ticker_obj = yf.Ticker(yf_ticker); info = ticker_obj.info
+        info, ticker_obj = get_stock_data_yf_retry(ticker)
         if not info or not info.get('symbol'):
-            logging.warning(f"Yahoo info for {ticker} empty or missing symbol. Checking history as fallback.")
-            hist = ticker_obj.history(period="5d")
-            if hist.empty: logging.warning(f"Ticker {ticker} not found or invalid on Yahoo Finance."); st.toast(f"⚠️ Couldn't find Yahoo equity data for '{ticker}'.", icon="⚠️"); return None
-            else:
-                 logging.warning(f"Ticker {ticker} info sparse/invalid, but history exists.")
-                 if not info: info = {}
-                 if 'symbol' not in info: info['symbol'] = yf_ticker
-                 if 'quoteType' not in info: info['quoteType'] = 'EQUITY' # Assume EQUITY if history exists
-                 # Patch price if needed
-                 if info.get('currentPrice') is None and info.get('regularMarketPrice') is None and info.get('previousClose') is None and not hist.empty: info['currentPrice'] = hist['Close'].iloc[-1]; logging.info(f"Patched price for {ticker}.")
+             logging.warning(f"get_stock_data_yf_retry returned empty/invalid info for {ticker}")
+             return None # Return None if fetch ultimately failed
 
         quote_type = info.get('quoteType', 'N/A')
-        # Warn for non-supported types, but still return data if available
+        # Warn for non-supported types
         if quote_type not in ['EQUITY', 'ETF', 'N/A', 'Undefined']:
              logging.warning(f"Ticker {ticker} is not typical EQUITY/ETF (Type: {quote_type}). Some features may be unreliable.");
              if quote_type not in ['N/A', 'Undefined']:
@@ -323,242 +455,53 @@ def get_stock_data(ticker):
 
         num_opinions = info.get("numberOfAnalystOpinions")
         data = {
-            "ticker": info.get("symbol", yf_ticker).upper(), "companyName": info.get("shortName", info.get("longName", "N/A")), "sector": info.get("sector", "N/A"), "industry": info.get("industry", "N/A"), "quoteType": quote_type,
+            "ticker": info.get("symbol", ticker).upper(), "companyName": info.get("shortName", info.get("longName", "N/A")), "sector": info.get("sector", "N/A"), "industry": info.get("industry", "N/A"), "quoteType": quote_type,
             "priceForDisplay": info.get("currentPrice", info.get("regularMarketPrice", info.get("regularMarketOpen", info.get("previousClose")))), "marketCap": info.get("marketCap"),
             "trailingPE": info.get("trailingPE"), "forwardPE": info.get("forwardPE"), "dividendYield": info.get("dividendYield"), "sma50": info.get("fiftyDayAverage"), "sma200": info.get("twoHundredDayAverage"),
-            "beta": info.get("beta"), "dayLow": info.get("dayLow"), "dayHigh": info.get("dayHigh"), "fiftyTwoWeekLow": info.get("fiftyTwoWeekLow"), "fiftyTwoWeekHigh": info.get("fiftyTwoWeekHigh"),
+            "beta": get_stock_beta(info), # Use helper for beta
+            "dayLow": info.get("dayLow"), "dayHigh": info.get("dayHigh"), "fiftyTwoWeekLow": info.get("fiftyTwoWeekLow"), "fiftyTwoWeekHigh": info.get("fiftyTwoWeekHigh"),
             "volume": info.get("volume", info.get("regularMarketVolume")), "recommendationKey": info.get("recommendationKey"), "targetMeanPrice": info.get("targetMeanPrice"),
             "targetLowPrice": info.get("targetLowPrice"), "targetHighPrice": info.get("targetHighPrice"), "numberOfAnalystOpinions": int(num_opinions) if num_opinions is not None and isinstance(num_opinions, (int, float)) and num_opinions > 0 else None,
             "website": info.get("website"), "longBusinessSummary": info.get("longBusinessSummary")
         }
-        if data["priceForDisplay"] is None: logging.warning(f"Could not determine price for {ticker}.")
-        logging.info(f"Successfully fetched Yahoo summary data for {data['ticker']} (Type: {data['quoteType']})"); return data
+        if data["priceForDisplay"] is None: logging.warning(f"Could not determine price for {ticker} from fetched info.")
+        logging.info(f"Successfully processed Yahoo summary data for {data['ticker']} (Type: {data['quoteType']})"); return data
+    except ValueError as ve:
+         # Catch the specific ValueError raised by get_stock_data_yf_retry on final failure
+         logging.warning(f"get_stock_data: Fetch ultimately failed for {ticker}: {ve}")
+         st.toast(f"⚠️ Couldn't find Yahoo equity data for '{ticker}'.", icon="⚠️")
+         return None
     except Exception as e:
-        err_str = str(e).lower()
-        if "no data found" in err_str or "404 client error" in err_str or "failed to decrypt" in err_str or "internal server error" in err_str: logging.warning(f"Yahoo Finance: Ticker {ticker} likely invalid/temp issue: {e}"); st.toast(f"⚠️ Couldn't find Yahoo data for '{ticker}'.", icon="⚠️")
-        else: logging.error(f"Error fetching yfinance data for {ticker}: {e}", exc_info=True); st.toast(f"⚠️ Error fetching data from Yahoo for {ticker}.", icon="❌")
+        # Catch any other unexpected errors during processing after fetch
+        logging.error(f"Error processing yfinance info for {ticker}: {e}", exc_info=True); st.toast(f"⚠️ Error processing data from Yahoo for {ticker}.", icon="❌")
         return None
 
-@st.cache_data(ttl=POLYGON_HISTORY_CACHE_DURATION_SECONDS)
-def fetch_polygon_price_data(ticker: str, days_back: int = 365*3): # Fetch enough for ~3 years for various indicator periods
-    logging.info(f"Fetching Polygon.io daily data for {ticker}")
-    try:
-        end_date = datetime.now().strftime('%Y-%m-%d')
-        start_date = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
-        # Use max limit per query to reduce calls if needed, but stick to reasonable days back
-        url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start_date}/{end_date}?adjusted=true&sort=asc&limit=5000&apiKey={POLYGON_API_KEY}"
-        response = requests.get(url, timeout=20) # Increased timeout slightly
-        response.raise_for_status()
-        data = response.json()
-        if data.get('results'):
-            df = pd.DataFrame(data['results'])
-            df['date'] = pd.to_datetime(df['t'], unit='ms')
-            df.set_index('date', inplace=True)
-            df.index.name = 'Date' # Align index name
-            df = df[['o', 'h', 'l', 'c', 'v']].rename(columns={'o': 'Open', 'h': 'High', 'l': 'Low', 'c': 'Close', 'v': 'Volume'})
-            logging.info(f"Polygon.io data fetched for {ticker}: {len(df)} rows from {df.index.min().strftime('%Y-%m-%d')} to {df.index.max().strftime('%Y-%m-%d')}")
-            return df
-        else:
-            logging.warning(f"No Polygon.io data found for {ticker}")
-            return None
-    except requests.exceptions.Timeout:
-        logging.error(f"Polygon.io Error: Request timed out for {ticker}")
-        st.toast(f"⚠️ Polygon.io data request timed out for {ticker}.", icon="❌")
-        return None
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Polygon.io Request Error for {ticker}: {e}")
-        st.toast(f"⚠️ Error fetching Polygon.io data for {ticker}.", icon="❌")
-        return None
-    except json.JSONDecodeError:
-        logging.error(f"Polygon.io Error: Could not decode JSON response for {ticker}.")
-        st.toast(f"⚠️ Error processing Polygon.io data for {ticker}.", icon="❌")
-        return None
-    except Exception as e:
-        logging.error(f"Unexpected Error fetching Polygon.io data for {ticker}: {e}", exc_info=True)
-        st.toast(f"⚠️ An unexpected error occurred fetching Polygon.io data for {ticker}.", icon="❌")
-        return None
-# --- System Prompt (UPDATED: Removed references to Technical Strategy Scan and updated Risk Score Factors) ---
-SYSTEM_PROMPT = f"""
-You are a helpful financial assistant. Your goal is to provide professional, accessible, and reliable information on topics related to the stock market, stocks, investments, bonds, economics (macro and micro), indices, and more. You have access to:
-You have access to:
-1.  Summary stock data from **Yahoo Finance**.
-2.  A calculated Dynamic Risk Score (**Model**).
-3.  A recent News Sentiment summary (**aggregated from NewsAPI, FMP, and RSS feeds over the last {NEWS_DAYS_BACK} days, analyzed using VADER**).
-4.  A short-term price forecast (**calculated using an ETS model on historical Yahoo Finance daily data**).
-5.  Momentum Signals (**calculated from Yahoo Finance daily data using RSI, MACD, CCI, Stochastic, and Williams %R indicators, providing BUY, SELL, or HOLD signals**).
-Important Guidelines:
-1.  Always answer in clear and concise English only, with correct punctuation.
-2.  Speak in an accessible, friendly, yet professional manner. Explain complex terms in simple language.
-3.  **Do not provide direct investment recommendations. Use an appropriate emoji naturally in your response, aiming for at least one if suitable.**
-4. **Prioritize using the data provided in the context.** Integrate data from **Yahoo Finance** for fundamentals and analyst views. Incorporate the provided **Model** Risk Score. Use the **Multi-Source News Sentiment (VADER analysis)** summary. Use the **ETS Forecast** data. Use the **Momentum Signals** summary for technical BUY/SELL/HOLD indications.
-5.  If presented with current data, incorporate it naturally. State the source for each piece of data clearly: **Yahoo Finance** for fundamentals/analyst views, **Multi-Source News/VADER** for news sentiment, **ETS Model (Calculated)** for the forecast, and **'Model'** for the risk score.
-6. If asked about a specific ticker, **structure your answer logically:**
-    a. Brief intro to the company.
-    b. Summary of key current data points from **Yahoo Finance** **using ONLY the data provided in the context.**
-    c. Analyst consensus from **Yahoo Finance** **using the exact format from Guideline #9 AND ONLY the data provided in the context.**
-    d. **Dynamic Risk Score:** State the calculated score and its category (e.g., 'Risk Score (Model): 65.25/100 (⚠️ High Risk)') **exactly as provided in the context.** If the context says it's 'Could not calculate' or similar, state that clearly.
-    e. **Recent News Sentiment Summary:** Present the news sentiment summary **exactly as provided in the context (sourced from Multi-Source News/VADER over {NEWS_DAYS_BACK} days).** Mention the counts (positive, negative, neutral) and the overall bias if available. State this reflects *recent* news articles.
-    f. **ETS Price Forecast:** Present the calculated forecast **exactly as provided in the context.** Mention the forecast period (e.g., "next 7 days"), the model used (e.g., "ETS Model"), and include the evaluation summary (RMSE/MAPE) if available. State this is a model-based forecast and not a guarantee. If the forecast is 'Unavailable' or there was an error, state that clearly.
-    g. **Momentum Signals:** Present the momentum signals summary **exactly as provided in the context (sourced from Yahoo Finance daily data).** Mention the final decision (BUY, SELL, HOLD) and the signals detected (e.g., RSI Oversold, MACD Bullish Cross). State this is based on technical indicators (RSI, MACD, CCI, Stochastic, Williams %R) and is not a recommendation. If the signals are 'Not calculated' or there was an error, state that clearly.
-    h. (Optional) Brief general context relative to its sector/industry (based on your background knowledge, state it's general context).
-    i. Concluding reminder about limitations and avoiding recommendations.
-7. **CRITICAL DATA HANDLING:** If the context for a data point (Price, Market Cap, Analyst Rec, Risk Score, News Sentiment Summary, **ETS Forecast**, **Momentum Signals**) explicitly states 'Not Available', 'Could not fetch', 'Error during scan', 'Could not calculate', 'Insufficient data', 'API error', 'No relevant news articles found', 'Unavailable', 'Model Error', etc., **you MUST state that the specific information is unavailable. DO NOT substitute from your internal knowledge.** Report what's available and clearly state what's missing.
-8.  Format numbers readably in English, **rounding to two decimal places** for currency and percentage values unless they represent counts or whole numbers like volume or shares. Use the format: "$123.45" or "5.67%". Market Cap can use B/T suffix, rounded to two decimals, e.g., "$770.52B".
-9.  **Regarding analyst data:** When analyst data (*is* provided in the context: numberOfAnalystOpinions, recommendationKey, targetMeanPrice, etc.), **use this exact format, including analyst count if available (not 'Not Available' or 0):** 'According to aggregated data from Yahoo Finance, based on [X] analysts, the prevailing recommendation is [recommendation], and the average 12-month target price is [average price], ranging from [low price] to [high price].' Emphasize this data comes from aggregated sources via **Yahoo Finance**. **Do not omit the analyst count if provided.** If analyst data is 'Not Available', state that.
-10. Be aware of limitations. Your knowledge is based on training data and provided context. Financial data is informational. **Price charts are not displayed.**
-11. **Do NOT mention technical strategy scans or signals**, as this feature has been removed. If the user asks to "scan" a ticker, explain that technical strategy scanning is not available, but you can provide other available information like risk score, news sentiment, and forecast.
-12. **About the Risk Score (if asked or when presenting it):** The 'Risk Score (Model)' provided in the context is calculated based on a combination of factors including **historical volatility, market capitalization, average trading volume (liquidity), market sensitivity (Beta), and recent price performance relative to its 50-day moving average.** Each factor is scored (0-100, higher score = higher risk for that factor) and weighted to produce a final score (0-100).
-    *   **Interpretation:** Scores >= 65 suggest ⚠️ High Risk, 50-64 suggest ⚖️ Medium Risk, and < 50 suggest ✅ Relatively Lower Risk *according to this specific model*. It is NOT a prediction or guarantee.
-13. **About News Sentiment (if asked or when presenting it):** The Recent News Sentiment summary provided in the context comes from **multiple sources (NewsAPI, FMP, RSS) over the last {NEWS_DAYS_BACK} days.** Sentiment (positive, negative, neutral) is determined by **VADER analysis** of article headlines and descriptions/summaries.
-    *   **Interpretation:** This gives a snapshot of the *tone* of recent news coverage based on the VADER algorithm. A 'Positive Bias' means more articles scored positive than negative (heuristically determined), and vice-versa for 'Negative Bias'. 'Neutral/Mixed Bias' indicates a balance. It reflects the *sentiment expressed in the text*, not necessarily the factual impact of the news. Use it as a gauge of recent news flow tone. **It is NOT a prediction.**
-14. **About ETS Forecasting (if asked or when presenting it):** The ETS Price Forecast provided in the context is generated using the **Exponential Smoothing (ETS) statistical model** on historical daily closing prices from **Yahoo Finance**.
-    *   **Methodology:** The model (typically Holt-Winters) attempts to capture trend and seasonality (if detected based on recent volatility) in the historical price data to project future values. It might be evaluated against recent data (RMSE/MAPE provided) to gauge its past accuracy on that specific stock.
-    *   **Interpretation:** This is a **statistical forecast**, not a prediction based on news, fundamentals, or external events. It essentially extrapolates patterns observed in past price movements. **It is NOT financial advice and has inherent limitations.** Market conditions can change unexpectedly, making any forecast uncertain. Use it as *one* technical data point, considering its potential inaccuracy (indicated by RMSE/MAPE if available).
-15. **About Momentum Signals (if asked or when presenting them):** The Momentum Signals summary provided in the context is calculated using **technical indicators (RSI, MACD, CCI, Stochastic, Williams %R)** on **Yahoo Finance daily price data**. The signals indicate potential **BUY**, **SELL**, or **HOLD** decisions based on oversold/overbought conditions or indicator crossovers.
-    *   **Methodology:** Each indicator is evaluated for specific thresholds (e.g., RSI < 30 for BUY, RSI > 70 for SELL). A majority rule determines the final decision: more BUY signals lead to a BUY decision, more SELL signals lead to a SELL decision, and an equal number or no signals result in HOLD.
-    *   **Interpretation:** These signals reflect **technical analysis patterns** and are not predictions or guarantees. They are based solely on historical price data and indicator calculations. Use them as a technical perspective, not financial advice. **They do NOT account for news, fundamentals, or external events.**
-"""
-def display_stock_data_dashboard(data, risk_score_value=None, risk_category_str="N/A", news_sentiment_counts=None, momentum_signals_summary="Momentum Signals: Not calculated."):
-    """Displays a dashboard summarizing key stock data using Streamlit metrics."""
-    if not data or not data.get('ticker'):
-        st.warning("Cannot display data dashboard - Stock data missing.")
-        return
-    ticker = data['ticker']
-    st.markdown(f"#### Current Data Snapshot for {ticker} - {data.get('companyName', 'N/A')}")
-    st.caption(f"**Type:** {data.get('quoteType', 'N/A')} | **Sector:** {data.get('sector', 'N/A')} | **Industry:** {data.get('industry', 'N/A')}")
-    st.divider()
-
-    # Row 1: Price, Market Cap, Risk
-    col1, col2, col3 = st.columns(3)
-    price_val = format_val(data.get('priceForDisplay'), '$', prec=2)
-    mcap_val = format_val(data.get('marketCap'), '$', prec=2)
-    risk_display_value = f"{risk_score_value:.2f}/100" if risk_score_value is not None and pd.notna(risk_score_value) else "N/A" # Check for pd.notna
-    with col1: st.metric(label="📈 Price (Yahoo)", value=price_val if price_val != "Not Available" else "Unavailable")
-    with col2: st.metric(label="📊 Market Cap (Yahoo)", value=mcap_val if mcap_val != "Not Available" else "Unavailable")
-    with col3: st.metric(label="⚖️ Risk Score (Model)", value=risk_display_value if risk_display_value != "Not Available" else "Unavailable", help=f"Model calculated risk: {risk_category_str}. See bot response for details.") # Check for "Not Available"
-    st.divider()
-
-    # Row 2: Ranges, Volume
-    col4, col5, col6 = st.columns(3)
-    day_low, day_high = format_val(data.get('dayLow'), '$', prec=2), format_val(data.get('dayHigh'), '$', prec=2)
-    daily_range = f"{day_low} - {day_high}" if day_low != "Not Available" and day_high != "Not Available" else "Not Available"
-    year_low, year_high = format_val(data.get('fiftyTwoWeekLow'), '$', prec=2), format_val(data.get('fiftyTwoWeekHigh'), '$', prec=2)
-    year_range = f"{year_low} - {year_high}" if year_low != "Not Available" and year_high != "Not Available" else "Not Available"
-    volume_val = format_val(data.get('volume'), prec=0)
-    with col4: st.metric(label="↕️ Daily Range (Yahoo)", value=daily_range if daily_range != "Not Available" else "Unavailable")
-    with col5: st.metric(label="🗓️ 52W Range (Yahoo)", value=year_range if year_range != "Not Available" else "Unavailable")
-    with col6: st.metric(label="💧 Volume (Yahoo)", value=volume_val if volume_val != "Not Available" else "Unavailable")
-    st.divider()
-
-    # Row 3: SMAs, Beta, P/E or P/S
-    col7, col8, col9 = st.columns(3)
-    sma50_val = format_val(data.get('sma50'), '$', prec=2)
-    sma200_val = format_val(data.get('sma200'), '$', prec=2)
-    beta_val = format_val(data.get('beta'), prec=2)
-    pe_ratio = data.get('trailingPE'); ps_ratio = data.get('priceToSalesTrailing12Months')
-    pe_ps_label = "⚖️ P/E (Trail)"; pe_ps_val = format_val(pe_ratio, prec=2)
-    if pe_ps_val == "Not Available" or (isinstance(pe_ratio, (int, float)) and pe_ratio <= 0 and (ps_ratio is not None and isinstance(ps_ratio, (int, float)) and ps_ratio > 0)):
-         pe_ps_label = "⚖️ P/S (Trail)"; pe_ps_val = format_val(ps_ratio, prec=2)
-    if pe_ps_val == "Not Available" and isinstance(pe_ratio, (int, float)) and pe_ratio < 0:
-         pe_ps_label = "⚖️ P/E (Trail)"; pe_ps_val = format_val(pe_ratio, prec=2)
-    with col7: st.metric(label="📉 50d SMA (Yahoo)", value=sma50_val if sma50_val != "Not Available" else "Unavailable")
-    with col8: st.metric(label="📉 200d SMA (Yahoo)", value=sma200_val if sma200_val != "Not Available" else "Unavailable")
-    with col9: st.metric(label=pe_ps_label, value=pe_ps_val if pe_ps_val != "Not Available" else "Unavailable")
-    st.divider()
-
-    # Row 4: Analyst View
-    st.markdown("#### 🎯 Analyst View (Aggregated: Yahoo Finance)")
-    colA, colB, colC = st.columns(3) # Adjusted columns
-    rec_key = data.get('recommendationKey'); num_opinions = data.get('numberOfAnalystOpinions'); mapped_rec = map_recommendation_key_to_english(rec_key); mean_target_val = format_val(data.get('targetMeanPrice'), '$', prec=2); low_target_val = format_val(data.get('targetLowPrice'), '$', prec=2); high_target_val = format_val(data.get('targetHighPrice'), '$', prec=2)
-    with colA: st.metric(label="⭐ Consensus", value=mapped_rec if mapped_rec not in ["Not Available", "N/A"] else "N/A")
-    with colB: st.metric(label="💲 Avg Target", value=mean_target_val if mean_target_val != "Not Available" else "Unavailable")
-    target_range = f"{low_target_val} - {high_target_val}" if low_target_val != "Not Available" and high_target_val != "Not Available" else "Not Available"
-    with colC: st.metric(label="↕️ Target Range", value=target_range if target_range != "Not Available" else "Unavailable")
-    if num_opinions and isinstance(num_opinions, int) and num_opinions > 0: st.caption(f"Based on {num_opinions} analysts")
-    else: st.caption("Analyst count unavailable")
-    st.divider()
-
-    # Row 5: News Sentiment
-    st.markdown(f"#### 📰 Recent News Sentiment ({NEWS_DAYS_BACK}d - Multi-Source / VADER)")
-    if news_sentiment_counts and news_sentiment_counts.get('total') is not None:
-         colE, colF, colG = st.columns(3)
-         pos_count = news_sentiment_counts.get('positive', 0); neg_count = news_sentiment_counts.get('negative', 0); neut_count = news_sentiment_counts.get('neutral', 0); total_count = news_sentiment_counts.get('total', 0)
-         with colE: st.metric(label="✅ Positive", value=pos_count)
-         with colF: st.metric(label="❌ Negative", value=neg_count)
-         with colG: st.metric(label="➖ Neutral", value=neut_count)
-         if total_count > 0:
-             if pos_count > neg_count + neut_count * 0.5: sentiment_label = "Positive Bias ✅"
-             elif neg_count > pos_count + neut_count * 0.5: sentiment_label = "Negative Bias ❌"
-             else: sentiment_label = "Neutral/Mixed Bias ⚖️"
-             st.caption(f"Overall based on ~{total_count} analyzed articles: **{sentiment_label}**")
-         else: st.caption("No relevant news articles found for analysis.")
-    else: st.info("News sentiment data not available or failed to fetch.")
-    st.divider()
-    # Row 6: Momentum Signals
-    st.markdown(f"#### 📡 Momentum Signals (Calculated from Yahoo Finance Daily Data)")
-    if momentum_signals_summary != "Trading Signals: Not calculated." and "Unavailable" not in momentum_signals_summary and "Error" not in momentum_signals_summary:
-        # Clean up the summary string for display, removing the first line and bullet points
-        display_summary = "\n".join(momentum_signals_summary.split('\n')[1:]).replace('- Final Decision: ', 'Final Decision: ').replace('- Signals: ', 'Signals: ')
-        st.markdown(display_summary.replace('\n', '<br>'), unsafe_allow_html=True)
-        st.caption(f"Based on RSI, MACD, CCI, Stochastic, and Williams %R indicators.")
-    else:
-        st.info("Momentum signals not available or failed to calculate.")
-    st.divider();
-    # Updated disclaimer in dashboard footer
-    st.caption(f"*Data: Yahoo Finance (via yfinance), Polygon.io (for TA signals), News (NewsAPI, FMP, RSS - {NEWS_DAYS_BACK}d / VADER), Wikipedia, Model Calculations, ETS Forecast. May be delayed. Not financial advice.*")
-
-
-
-@st.cache_data(ttl=300)
-def safe_yf_info(ticker):
-    try:
-        ticker_obj = yf.Ticker(ticker)
-        info = ticker_obj.info
-        if not info or 'symbol' not in info:
-            return None
-        return info
-    except Exception as e:
-        logging.warning(f"YF info fetch failed for {ticker}: {e}")
-        return None
 
 @st.cache_data(ttl=HISTORY_CACHE_DURATION_SECONDS)
 def get_unified_yfinance_history(ticker: str, period="3y"):
     """
-    Fetches Yahoo Finance history for Risk Score & ETS Forecast.
+    Fetches Yahoo Finance history using the retry-decorated function.
     Returns Close series for ETS and full OHLCV df for Risk Score factors.
+    Handles potential errors from the decorated function.
     """
-    logging.info(f"Fetching UNIFIED yfinance history for {ticker}, period: {period}")
     try:
-        yf_ticker_obj = yf.Ticker(ticker)
-        df = yf_ticker_obj.history(period=period, interval="1d", auto_adjust=False)
-        if df is None or df.empty: logging.warning(f"No data from unified yfinance history for {ticker}."); st.toast(f"⚠️ yfinance no unified history for {ticker}.", icon="⚠️"); return None, None
-        required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
-        # Ensure all required columns exist before proceeding
-        if not all(col in df.columns for col in required_cols):
-             missing_cols = [col for col in required_cols if col not in df.columns]
-             logging.warning(f"Missing required columns ({missing_cols}) in unified yfinance data for {ticker}. Found: {df.columns.tolist()}. Risk/ETS features depending on these might fail.")
-             # We still return the data with available columns if 'Close' is present,
-             # so that risk factors relying only on Close/Returns can still be calculated.
-             if 'Close' in df.columns:
-                 available_cols = [col for col in required_cols if col in df.columns]
-                 return df['Close'].copy(), df[available_cols].copy()
-             else:
-                 logging.error(f"Unified yfinance history for {ticker} missing 'Close' column. Cannot proceed.")
-                 return None, None
+        # Call the retry-decorated function
+        close_series, full_df = get_unified_yfinance_history_retry(ticker, period=period)
+        # The retry function raises ValueError on ultimate failure, which will be caught here
+        if full_df is None or full_df.empty:
+             logging.warning(f"get_unified_yfinance_history_retry returned empty/invalid data for {ticker}. History unavailable.")
+             return None, None
+        return close_series, full_df
+    except ValueError as ve:
+        # Catch the specific ValueError raised by the retry function on final failure
+        logging.warning(f"get_unified_yfinance_history: Fetch ultimately failed for {ticker}: {ve}")
+        st.toast(f"⚠️ yfinance history unavailable for {ticker}.", icon="⚠️")
+        return None, None
+    except Exception as e:
+        # Catch any other unexpected errors during processing after fetch
+        logging.error(f"Error processing yfinance history for {ticker}: {e}", exc_info=True); st.toast(f"⚠️ Error processing history data for {ticker}.", icon="❌")
+        return None, None
 
-        if isinstance(df.index, pd.DatetimeIndex) and df.index.tz is not None:
-            try: df.index = df.index.tz_convert('America/New_York').tz_localize(None) # Convert and remove timezone
-            except Exception as tz_err: logging.warning(f"Unified yfinance index tz conversion failed: {tz_err}."); pass
-        elif not isinstance(df.index, pd.DatetimeIndex): logging.warning(f"Unified yfinance index for {ticker} not DatetimeIndex.")
-
-        min_rows_needed_for_full_risk = 252 # ~1 year of data for volatility/beta/SMA
-        if len(df) < min_rows_needed_for_full_risk:
-            logging.warning(f"Unified yfinance history for {ticker} has only {len(df)} rows (period={period}). Some Risk calculations might be unreliable or fail.")
-        else:
-            logging.info(f"Processed unified yfinance history for {ticker} ({len(df)} rows)")
-
-        return df['Close'].copy(), df[required_cols].copy() # Return Close series, and a copy of the required columns df
-    except Exception as e: logging.error(f"General unified yfinance history fetch error for {ticker}: {e}", exc_info=True); st.toast(f"⚠️ Error fetching history data for {ticker}.", icon="❌"); return None, None
 
 # Manual Momentum Indicator Calculations
 # @st.cache_data(ttl=POLYGON_HISTORY_CACHE_DURATION_SECONDS) # Cache is handled at the fetch level
@@ -585,9 +528,8 @@ def calculate_momentum_indicators(df: pd.DataFrame):
     rs = avg_gain / (avg_loss + 1e-9) # Add epsilon here for division
     df_ta['RSI'] = 100 - (100 / (1 + rs))
     # Handle cases where the original avg_loss was truly NaN or result is Inf/NaN
-    df_ta['RSI'] = df_ta['RSI'].replace([np.inf, -np.inf], 100) # Replace inf with 100 (all gains)
-    df_ta['RSI'] = df_ta['RSI'].fillna(0) # Fill initial NaNs (first 14 periods) with 0
-
+    df_ta['RSI'] = df_ta['RSI'].replace([np.inf, -np.inf], np.nan) # Replace inf/neg-inf with NaN first
+    df_ta['RSI'] = df_ta['RSI'].fillna(0) # Fill initial NaNs (first 14 periods) and results of division by zero/nan
 
     # --- MACD (12, 26, 9) ---
     logging.debug("Calculating MACD...")
@@ -616,7 +558,8 @@ def calculate_momentum_indicators(df: pd.DataFrame):
         return np.mean(np.abs(valid_series_array - np.mean(valid_series_array)))
 
     # Apply mean deviation rolling window
-    md_tp = tp.rolling(window=20).apply(mean_deviation, raw=True) # raw=True passes numpy array for performance
+    # Use raw=True to pass numpy array to the aggregation function for performance
+    md_tp = tp.rolling(window=20).apply(mean_deviation, raw=True)
     # Handle division by zero or zero mean deviation (add epsilon or replace with NaN)
     denominator = 0.015 * md_tp;
     # Add a small epsilon to the denominator if it's zero or near-zero, or replace with NaN for robustness
@@ -635,7 +578,7 @@ def calculate_momentum_indicators(df: pd.DataFrame):
     # Add a small epsilon to the denominator if it's zero or near-zero
     range_hl_safe = range_hl.copy(); range_hl_safe[range_hl_safe < 1e-9] = np.nan # Use NaN for robustness
     df_ta['Stoch_%K'] = 100 * ((df_ta['Close'] - lowest_low) / range_hl_safe) # Use safe denominator
-    # Replace Inf/NaN results with 0.
+    # Replace Inf/NaN results with NaN first, then fill NaNs with 0.
     df_ta['Stoch_%K'] = df_ta['Stoch_%K'].replace([np.inf, -np.inf], np.nan).fillna(0)
     # Calculate %D (3-day SMA of %K), fill initial NaNs with 0.
     df_ta['Stoch_%D'] = df_ta['Stoch_%K'].rolling(window=3).mean().fillna(0)
@@ -649,7 +592,7 @@ def calculate_momentum_indicators(df: pd.DataFrame):
     # Add a small epsilon to the denominator if it's zero or near-zero
     range_hw_safe = range_hw.copy(); range_hw_safe[range_hw_safe < 1e-9] = np.nan # Use NaN for robustness
     df_ta['Williams_%R'] = ((highest_high_w - df_ta['Close']) / range_hw_safe) * -100 # Use safe denominator
-    # Replace Inf/NaN results with 0.
+    # Replace Inf/NaN results with NaN first, then fill NaNs with 0.
     df_ta['Williams_%R'] = df_ta['Williams_%R'].replace([np.inf, -np.inf], np.nan).fillna(0)
 
     logging.info(f"Finished calculating momentum indicators. Total rows: {len(df_ta)}. Latest row indicator NaNs: {df_ta.iloc[-1][['RSI', 'MACD', 'MACD_Signal', 'CCI', 'Stoch_%K', 'Williams_%R']].isna().sum()}")
@@ -732,7 +675,9 @@ def forecast_stock_ets_advanced( ticker: str, close_prices: pd.Series, forecast_
                      rmse = None; evaluation_summary = "Evaluation Error: Length mismatch"
 
 
-                if rmse is not None: # If index/length matching or any other step failed, rmse would be None
+                if rmse is None: # If index/length matching failed or any other step failed, rmse would be None
+                     evaluation_summary = evaluation_summary # Keep the specific error message
+                else:
                     rmse = np.sqrt(mean_squared_error(test_eval, eval_forecast))
                     avg_price_eval = test_eval.mean()
                     # Handle case where test_eval mean is zero or near-zero
@@ -767,7 +712,13 @@ def forecast_stock_ets_advanced( ticker: str, close_prices: pd.Series, forecast_
         else:
             logger.warning("[Forecast] Cannot generate date index for forecast (input index issue or empty data). Using default numerical index.")
 
-        model_used_desc = f"ETS({'A' if model_params.get('trend')=='add' else 'M'}, {'A' if model_params.get('seasonal')=='add' else 'N'}, {'A' if use_seasonal else 'N'}{f' damped' if model_params.get('damped_trend') else ''})"
+        # Construct model description dynamically
+        trend_part = model_params.get('trend', 'N')
+        seasonal_part = model_params.get('seasonal', 'N') if use_seasonal else 'N'
+        damped_part = 'damped' if model_params.get('damped_trend') else ''
+        model_used_desc = f"ETS({trend_part},{seasonal_part},{'A' if use_seasonal else 'N'}{f' {damped_part}' if damped_part else ''})".strip()
+        model_used_desc = model_used_desc.replace("ETS(A,N,N)", "ETS(A)").replace("ETS(A,A,A damped)", "ETS(A,A) Damped") # Simplify common cases
+
         logger.info(f"[Forecast] Forecast generation successful using {model_used_desc}.")
 
         return forecast_result, evaluation_summary, model_used_desc
@@ -1022,14 +973,14 @@ def get_stock_beta(ticker_info: dict):
     """Extracts beta from yfinance info, handling different keys and types."""
     if not ticker_info: return None
     beta = ticker_info.get('beta', ticker_info.get('beta3Year'))
+    if beta is not None and pd.isna(beta): return None # Explicitly check for NaN
     if beta is not None and not isinstance(beta, (int, float)):
         try: beta = float(beta)
         except (ValueError, TypeError): beta = None
     # yfinance often returns beta of 0 for indices/ETFs. Check quoteType.
     if beta is not None and beta == 0.0 and ticker_info.get('quoteType', '').upper() in ['INDEX', 'ETF']:
-         logging.debug(f"Beta is 0 for {ticker_info.get('symbol')}, likely an index/ETF, returning None.")
+         logging.debug(f"Beta is 0.0 for {ticker_info.get('symbol')}, likely an index/ETF, returning None.")
          return None
-
     return beta
 def normalize_score(value, range_min, range_max, higher_is_riskier=True, is_log_range=False):
     """Normalizes a raw value to a 0-100 risk score based on a defined range."""
@@ -1092,15 +1043,26 @@ def normalize_score(value, range_min, range_max, higher_is_riskier=True, is_log_
 
 def calculate_sma(data: pd.Series, window: int):
     """Calculates the last value of a Simple Moving Average."""
-    if data is None or data.empty or len(data) < window: return None
-    try: return data.rolling(window=window).mean().iloc[-1]
-    except Exception as e: logging.warning(f"SMA{window} error: {e}"); return None
+    if data is None or data.empty or len(data) < window:
+         logging.debug(f"SMA{window}: Insufficient data ({len(data)}).")
+         return np.nan # Use np.nan instead of None for consistency with pandas calculations
+    try:
+        # Explicitly handle potential NaN/Inf in input data before rolling
+        valid_data = data.replace([np.inf, -np.inf], np.nan).dropna()
+        if len(valid_data) < window:
+             logging.debug(f"SMA{window}: Insufficient *valid* data ({len(valid_data)}).")
+             return np.nan
+        return valid_data.rolling(window=window).mean().iloc[-1]
+    except Exception as e: logging.warning(f"SMA{window} error: {e}"); return np.nan
+
 
 @st.cache_data(ttl=3600*6)
 def calculate_piotroski_f_score(ticker_symbol: str):
     """Calculates the Piotroski F-Score. (Not used in simplified risk score)."""
     logging.info(f"[{ticker_symbol}] Calculating Piotroski F-Score (or cache)..."); score = 0; details = {}
     try:
+        # Note: These fetches are NOT using the retry decorator directly, relying on yfinance's internal retries or hoping these endpoints are less rate-limited
+        # If these prove flaky, they would also need a similar retry wrapper.
         ticker = yf.Ticker(ticker_symbol); income = get_financial_data(ticker, 'income_stmt', 2); balance = get_financial_data(ticker, 'balance_sheet', 2); cashflow = get_financial_data(ticker, 'cashflow', 2)
         if income is None or balance is None or cashflow is None or \
            income.shape[1] < 2 or balance.shape[1] < 2 or cashflow.shape[1] < 2: logging.warning(f"[{ticker_symbol}] Insufficient financials for F-Score (need 2 periods)."); return None, details
@@ -1214,113 +1176,124 @@ def calculate_dynamic_risk_score(ticker: str, df_history: pd.DataFrame, info: di
     simplified_factors = ['volatility', 'market_cap', 'liquidity', 'beta', 'price_vs_sma', 'vix']
     effective_weights = {k: weights.get(k, 0) for k in simplified_factors}
 
-    # Validate input data
+    # Validate input data presence before proceeding
     if df_history is None or df_history.empty or 'Close' not in df_history.columns:
-        logging.error(f"No valid OHLCV data (df_history) for {ticker} for simplified risk score calculation.")
-        return None, {}, 0.0
+        logging.error(f"Risk Calculation for {ticker}: No valid OHLCV data (df_history) for calculation.")
+        # Set all factor scores to NaN and effective weights to 0
+        for factor in simplified_factors: intermediate_scores[factor] = np.nan; effective_weights[factor] = 0.0
+        return None, intermediate_scores, 0.0
+
     if not info:
-         logging.warning(f"No Yahoo Ticker info for {ticker}. Some risk factors will be unavailable.")
+         logging.warning(f"Risk Calculation for {ticker}: No Yahoo Ticker info. Some risk factors will be unavailable.")
+         # For factors dependent on info, set score to NaN and weight to 0
+         for factor in ['market_cap', 'beta']: intermediate_scores[factor] = np.nan; effective_weights[factor] = 0.0
 
 
     # Ensure Close prices series is available for return-based calcs
     close_prices = df_history['Close']
     if close_prices.empty:
-         logging.error(f"Close price series is empty for {ticker}. Cannot calculate return-based risk factors.")
+         logging.error(f"Risk Calculation for {ticker}: Close price series is empty. Cannot calculate return-based risk factors.")
+         # Set return/price-based factors to NaN and weight to 0
+         for factor in ['volatility', 'price_vs_sma']: intermediate_scores[factor] = np.nan; effective_weights[factor] = 0.0
+         # Also check Volume presence for liquidity
+         if 'Volume' not in df_history.columns: intermediate_scores['liquidity'] = np.nan; effective_weights['liquidity'] = 0.0
+
 
     # Use a recent period for volatility and returns (e.g., 1 year)
+    # Ensure recent_period_days is not more than available data points minus 1 (for pct_change)
     recent_period_days = min(252, len(df_history)) # Use up to ~1 year or whatever is available
-    if recent_period_days < 20: # Need at least some data
-        logging.warning(f"Only {len(df_history)} days of history for {ticker}. Most risk factors will be unavailable.")
-        recent_close_prices = pd.Series(dtype=float) # Effectively empty
-    else:
+    if recent_period_days > 1:
         recent_close_prices = close_prices.iloc[-recent_period_days:]
-
-    recent_returns = recent_close_prices.pct_change().dropna()
-    min_return_points = 20 # Minimum points for volatility
-
-    # --- Factor Calculations (Simplified) ---
-
-    # 1. Volatility (annualized standard deviation of recent daily returns)
-    if len(recent_returns) >= min_return_points:
-        volatility = recent_returns.std() * np.sqrt(252) # Annualized
-        intermediate_scores['volatility'] = normalize_score(volatility, *VOLATILITY_RANGE)
-        logging.debug(f"[{ticker}] Volatility ({len(recent_returns)} days): {volatility:.4f}, Score: {intermediate_scores['volatility']:.2f}")
+        recent_returns = recent_close_prices.pct_change().dropna()
+        min_return_points = 20 # Minimum points for volatility
+        if len(recent_returns) >= min_return_points:
+            volatility = recent_returns.std() * np.sqrt(252) # Annualized
+            intermediate_scores['volatility'] = normalize_score(volatility, *VOLATILITY_RANGE)
+            logging.debug(f"[{ticker}] Volatility ({len(recent_returns)} days): {volatility:.4f}, Score: {intermediate_scores['volatility']:.2f}")
+        else:
+            intermediate_scores['volatility'] = np.nan
+            effective_weights['volatility'] = 0.0
+            logging.debug(f"[{ticker}] Volatility: Insufficient return data ({len(recent_returns)} returns) for window {min_return_points}.")
     else:
         intermediate_scores['volatility'] = np.nan
         effective_weights['volatility'] = 0.0
-        logging.debug(f"[{ticker}] Volatility: Insufficient data ({len(recent_returns)} returns).")
+        logging.debug(f"[{ticker}] Volatility: Insufficient history data ({len(df_history)} days) for window {recent_period_days}.")
 
-    # 2. Market Cap (smaller = riskier)
-    market_cap = info.get('marketCap')
-    if market_cap is not None and pd.notna(market_cap) and market_cap > 0:
-        # Invert score: smaller market cap = higher risk
-        score = normalize_score(market_cap, *MARKET_CAP_RANGE_LOG, is_log_range=True)
-        intermediate_scores['market_cap'] = 100 - score
-        logging.debug(f"[{ticker}] Market Cap: {market_cap:.2f}, Score: {intermediate_scores['market_cap']:.2f}")
-    else:
-        intermediate_scores['market_cap'] = np.nan
-        effective_weights['market_cap'] = 0.0
-        logging.debug(f"[{ticker}] Market Cap: Not available or zero.")
+
+    # 2. Market Cap (smaller = riskier) - Depends on info dict
+    if 'market_cap' not in intermediate_scores: # Check if already marked unavailable
+         market_cap = info.get('marketCap')
+         if market_cap is not None and pd.notna(market_cap) and market_cap > 0:
+             # Invert score: smaller market cap = higher risk
+             score = normalize_score(market_cap, *MARKET_CAP_RANGE_LOG, is_log_range=True)
+             intermediate_scores['market_cap'] = 100 - score
+             logging.debug(f"[{ticker}] Market Cap: {format_val(market_cap, '$', prec=0)}, Score: {intermediate_scores['market_cap']:.2f}")
+         else:
+             intermediate_scores['market_cap'] = np.nan
+             effective_weights['market_cap'] = 0.0
+             logging.debug(f"[{ticker}] Market Cap: Not available, zero, or invalid.")
+
 
     # 3. Liquidity (average daily volume over recent period, lower = riskier)
-    # Use the same recent period as volatility for volume average
-    recent_volume_df = df_history['Volume'].iloc[-recent_period_days:] if 'Volume' in df_history.columns and len(df_history) >= recent_period_days else df_history['Volume']
-    avg_volume = recent_volume_df.mean() if 'Volume' in df_history.columns and not recent_volume_df.empty and recent_volume_df.dropna().shape[0] > 0 else None
+    # Use the same recent period as volatility for volume average, depends on Volume column
+    if 'liquidity' not in intermediate_scores: # Check if already marked unavailable
+         recent_volume_series = df_history['Volume'].iloc[-recent_period_days:] if 'Volume' in df_history.columns and recent_period_days > 0 else pd.Series(dtype=float)
+         avg_volume = recent_volume_series.mean() if not recent_volume_series.empty and recent_volume_series.dropna().shape[0] > 0 else None
 
-    if avg_volume is not None and pd.notna(avg_volume) and avg_volume > 0:
-        # Invert score: lower volume = higher risk
-        score = normalize_score(avg_volume, *VOLUME_RANGE_LOG, is_log_range=True)
-        intermediate_scores['liquidity'] = 100 - score
-        logging.debug(f"[{ticker}] Liquidity (Avg Volume {len(recent_volume_df)} days): {avg_volume:.0f}, Score: {intermediate_scores['liquidity']:.2f}")
-    else:
-        intermediate_scores['liquidity'] = np.nan
-        effective_weights['liquidity'] = 0.0
-        logging.debug(f"[{ticker}] Liquidity: Not available or zero.")
+         if avg_volume is not None and pd.notna(avg_volume) and avg_volume > 0:
+             # Invert score: lower volume = higher risk
+             score = normalize_score(avg_volume, *VOLUME_RANGE_LOG, is_log_range=True)
+             intermediate_scores['liquidity'] = 100 - score
+             logging.debug(f"[{ticker}] Liquidity (Avg Volume {len(recent_volume_series)} days): {avg_volume:.0f}, Score: {intermediate_scores['liquidity']:.2f}")
+         else:
+             intermediate_scores['liquidity'] = np.nan
+             effective_weights['liquidity'] = 0.0
+             logging.debug(f"[{ticker}] Liquidity: Not available, zero, invalid, or insufficient history.")
 
 
-    # 4. Beta (higher = riskier)
-    beta = get_stock_beta(info) # Use helper function
-    if beta is not None and pd.notna(beta):
-        intermediate_scores['beta'] = normalize_score(beta, *BETA_RANGE)
-        logging.debug(f"[{ticker}] Beta: {beta:.2f}, Score: {intermediate_scores['beta']:.2f}")
-    else:
-        intermediate_scores['beta'] = np.nan
-        effective_weights['beta'] = 0.0
-        logging.debug(f"[{ticker}] Beta: Not available.")
+    # 4. Beta (higher = riskier) - Depends on info dict
+    if 'beta' not in intermediate_scores: # Check if already marked unavailable
+         beta = get_stock_beta(info) # Use helper function
+         if beta is not None and pd.notna(beta):
+             intermediate_scores['beta'] = normalize_score(beta, *BETA_RANGE)
+             logging.debug(f"[{ticker}] Beta: {beta:.2f}, Score: {intermediate_scores['beta']:.2f}")
+         else:
+             intermediate_scores['beta'] = np.nan
+             effective_weights['beta'] = 0.0
+             logging.debug(f"[{ticker}] Beta: Not available or invalid.")
 
     # 5. Price vs. SMA (deviation from 50-day SMA, larger abs deviation = riskier)
-    # Need at least 50 days of history for 50-day SMA
-    if len(close_prices) >= 50:
-        sma50 = calculate_sma(close_prices, 50) # Use our SMA helper
-        current_price = close_prices.iloc[-1] if not close_prices.empty else None
-        if sma50 is not None and pd.notna(sma50) and current_price is not None and pd.notna(current_price) and sma50 > 0:
-            deviation = (current_price - sma50) / sma50
-            # Normalize the absolute value against the positive range of the deviation magnitude
-            intermediate_scores['price_vs_sma'] = normalize_score(abs(deviation), 0, abs(PRICE_VS_SMA_RANGE[0]) if abs(PRICE_VS_SMA_RANGE[0]) > abs(PRICE_VS_SMA_RANGE[1]) else abs(PRICE_VS_SMA_RANGE[1]), higher_is_riskier=True)
-            logging.debug(f"[{ticker}] Price vs SMA50 Deviation: {deviation:.4f}, Score: {intermediate_scores['price_vs_sma']:.2f}")
+    # Needs enough data for SMA50, depends on Close prices
+    if 'price_vs_sma' not in intermediate_scores: # Check if already marked unavailable
+        if len(close_prices) >= 50:
+            sma50 = calculate_sma(close_prices, 50) # Use our SMA helper
+            current_price = close_prices.iloc[-1] if not close_prices.empty else None
+            if sma50 is not None and pd.notna(sma50) and current_price is not None and pd.notna(current_price) and sma50 > 0:
+                deviation = (current_price - sma50) / sma50
+                # Normalize the absolute value against the positive range of the deviation magnitude
+                # The range for deviation magnitude is [0, max(abs(min_dev), abs(max_dev))]
+                deviation_magnitude_range_max = max(abs(PRICE_VS_SMA_RANGE[0] or 0), abs(PRICE_VS_SMA_RANGE[1] or 0))
+                if deviation_magnitude_range_max > 1e-9: # Avoid division by zero in normalize_score
+                     intermediate_scores['price_vs_sma'] = normalize_score(abs(deviation), 0, deviation_magnitude_range_max, higher_is_riskier=True)
+                     logging.debug(f"[{ticker}] Price vs SMA50 Deviation: {deviation:.4f} (Abs: {abs(deviation):.4f}), Score: {intermediate_scores['price_vs_sma']:.2f}")
+                else:
+                     intermediate_scores['price_vs_sma'] = np.nan
+                     effective_weights['price_vs_sma'] = 0.0
+                     logging.warning(f"[{ticker}] Price vs SMA: Deviation magnitude range is zero or near zero ({deviation_magnitude_range_max}).")
+            else:
+                intermediate_scores['price_vs_sma'] = np.nan
+                effective_weights['price_vs_sma'] = 0.0
+                logging.debug(f"[{ticker}] Price vs SMA: SMA50 or Current Price calculation failed or SMA50 is zero/negative.")
         else:
             intermediate_scores['price_vs_sma'] = np.nan
             effective_weights['price_vs_sma'] = 0.0
-            logging.debug(f"[{ticker}] Price vs SMA: Insufficient data or SMA calculation failed.")
-    else:
-        intermediate_scores['price_vs_sma'] = np.nan
-        effective_weights['price_vs_sma'] = 0.0
-        logging.debug(f"[{ticker}] Price vs SMA: Insufficient data ({len(close_prices)} prices). Need >= 50.")
+            logging.debug(f"[{ticker}] Price vs SMA: Insufficient data ({len(close_prices)} prices). Need >= 50 for SMA50.")
 
 
-    # 6. VIX (market-wide volatility, higher = riskier) - Fetch separately
-    @st.cache_data(ttl=VIX_CACHE_DURATION_SECONDS)
-    def _get_vix_close():
-        try:
-            vix_ticker = yf.Ticker("^VIX")
-            # Fetch last 5 days to be safe and get latest close
-            vix_data = vix_ticker.history(period="5d", interval="1d")['Close']
-            return vix_data.dropna().iloc[-1] if not vix_data.empty and not vix_data.dropna().empty else None
-        except Exception as vix_e:
-            logging.warning(f"Could not fetch VIX data: {vix_e}")
-            return None
-
-    vix = _get_vix_close() # Call the inner cached function
+    # 6. VIX (market-wide volatility, higher = riskier) - Fetch separately using retry decorator
+    # This factor adds market context and is less dependent on the individual stock's history/info
+    # VIX score is added regardless of whether stock data was fully available, as long as VIX data is available
+    vix = _get_vix_close_retry() # Call the inner cached, retry-decorated function
     if vix is not None and pd.notna(vix):
         intermediate_scores['vix'] = normalize_score(vix, *VIX_RANGE)
         logging.debug(f"[{ticker}] VIX: {vix:.2f}, Score: {intermediate_scores['vix']:.2f}")
@@ -1340,15 +1313,17 @@ def calculate_dynamic_risk_score(ticker: str, df_history: pd.DataFrame, info: di
     valid_weights_mapping = {k: effective_weights.get(k, 0) for k in valid_scores.keys()}
     weight_sum = sum(valid_weights_mapping.values())
     logging.debug(f"[{ticker}] Valid Weights (mapped): {valid_weights_mapping}")
-    logging.debug(f"[{ticker}] Calculated Weight Sum: {weight_sum:.4f}")
+    logging.debug(f"[{ticker}] Calculated Weight Sum for final score: {weight_sum:.4f}")
 
 
+    final_score = None
     if weight_sum > 1e-9:  # Check against a small epsilon to avoid near-zero division
         # Normalize weights to sum to 1 using only weights of valid factors
         normalized_weights = {k: v / weight_sum for k, v in valid_weights_mapping.items()}
         final_score = sum(score * normalized_weights[factor] for factor, score in valid_scores.items())
-        final_score = np.clip(final_score, 0, 100)  # Ensure score is between 0 and 100
-        final_score = min(final_score + 35.0, 100.0)  # Add 20 points, cap at 100
+        # Apply a base score offset and clip
+        final_score = min(final_score + 35.0, 100.0)  # Add offset, cap at 100. Offset might need tuning.
+        final_score = max(final_score, 0.0) # Ensure not below 0
         logging.info(f"Simplified Risk score for {ticker} calculated: {final_score:.2f} (using {len(valid_scores)}/{len(simplified_factors)} factors)")
     else:
         logging.warning(f"[{ticker}] No valid factors calculated or total effective weight is zero. Cannot calculate risk score.")
@@ -1404,46 +1379,57 @@ def generate_trading_signals(ticker: str, indicators_df: pd.DataFrame):
         signals = []
 
         # RSI
+        # Ensure indicator value is not NaN before using
         if latest['RSI'] is not None and pd.notna(latest['RSI']):
             if latest['RSI'] < 30: signals.append("BUY (RSI Oversold)")
             elif latest['RSI'] > 70: signals.append("SELL (RSI Overbought)")
+            logging.debug(f"RSI: {latest['RSI']:.2f}") # Log indicator value
 
         # MACD
         if latest['MACD'] is not None and pd.notna(latest['MACD']) and latest['MACD_Signal'] is not None and pd.notna(latest['MACD_Signal']):
+            logging.debug(f"MACD: {latest['MACD']:.4f}, Signal: {latest['MACD_Signal']:.4f}") # Log indicator values
             # MACD crosses Signal line (Bullish cross)
             # Check current MACD > Signal AND previous MACD <= Signal (requires at least 2 rows)
             if len(indicators_df) >= 2:
                 prev = indicators_df.iloc[-2][required_indicators]
                 # Ensure previous values are also valid before checking crossover
                 if prev['MACD'] is not None and pd.notna(prev['MACD']) and prev['MACD_Signal'] is not None and pd.notna(prev['MACD_Signal']):
+                    logging.debug(f"MACD Previous: {prev['MACD']:.4f}, Signal Previous: {prev['MACD_Signal']:.4f}")
                     if latest['MACD'] > latest['MACD_Signal'] and prev['MACD'] <= prev['MACD_Signal']:
                          signals.append("BUY (MACD Bullish Crossover)")
                     elif latest['MACD'] < latest['MACD_Signal'] and prev['MACD'] >= prev['MACD_Signal']:
                          signals.append("SELL (MACD Bearish Crossover)")
                 else:
+                    logging.debug("Previous MACD/Signal data invalid, checking current position only.")
                     # Fallback to simple MACD vs Signal position if not enough data for crossover or prev data is invalid
                     if latest['MACD'] > latest['MACD_Signal']: signals.append("BUY (MACD Above Signal)")
                     elif latest['MACD'] < latest['MACD_Signal']: signals.append("SELL (MACD Below Signal)")
             else:
+                 logging.debug("Insufficient data for MACD crossover (need >= 2 rows), checking current position only.")
                  # Fallback to simple MACD vs Signal position if not enough data for crossover
                  if latest['MACD'] > latest['MACD_Signal']: signals.append("BUY (MACD Above Signal)")
                  elif latest['MACD'] < latest['MACD_Signal']: signals.append("SELL (MACD Below Signal)")
+        else:
+            logging.debug("MACD or Signal data not available.")
 
 
         # CCI
         if latest['CCI'] is not None and pd.notna(latest['CCI']):
+            logging.debug(f"CCI: {latest['CCI']:.2f}")
             if latest['CCI'] < -100: signals.append("BUY (CCI Oversold)")
             elif latest['CCI'] > 100: signals.append("SELL (CCI Overbought)")
 
         # Stochastic (%K crossing 20/80, or %K crossing %D 20/80)
         # Let's use %K crossing thresholds for simplicity, as %D requires more logic
         if latest['Stoch_%K'] is not None and pd.notna(latest['Stoch_%K']):
+             logging.debug(f"Stoch %K: {latest['Stoch_%K']:.2f}")
              if latest['Stoch_%K'] < 20: signals.append("BUY (Stoch %K Oversold)")
              elif latest['Stoch_%K'] > 80: signals.append("SELL (Stoch %K Overbought)")
              # Could add %K/%D crossover signals here if desired
 
         # Williams %R
         if latest['Williams_%R'] is not None and pd.notna(latest['Williams_%R']):
+            logging.debug(f"Williams %R: {latest['Williams_%R']:.2f}")
             # Williams %R is inverted compared to Stochastic (%R < -80 is oversold/BUY, %R > -20 is overbought/SELL)
             if latest['Williams_%R'] <= -80: signals.append("BUY (Williams %R Oversold)")
             elif latest['Williams_%R'] >= -20: signals.append("SELL (Williams %R Overbought)")
@@ -1502,7 +1488,8 @@ def format_stock_data_for_prompt(data):
     filtered_lines = [lines[0]] + [ln for ln in lines[1:] if not (ln.strip().endswith(": Not Available") or ln.strip().endswith(": N/A") ) or ln.startswith("- Analyst Consensus")];
 
     # Check if core data (like price) is present
-    if not any("Price" in ln for ln in filtered_lines): return f"Could not retrieve key data (like price) from Yahoo for {ticker}."
+    if not any("Price" in ln for ln in filtered_lines): return f"Could not retrieve key data (like price) from Yahoo for {ticker}."; # Simplified message
+
 
     return "\n".join(filtered_lines)
 
@@ -1531,9 +1518,9 @@ def map_recommendation_key_to_english(key):
     if key is None: return "Not Available"
     return mapping.get(str(key).lower(), str(key).capitalize() if key else "Not Available")
 
-# [Wikipedia Index Lookup functions remain the same]
-# ... (previous imports and code remain unchanged) ...
 
+# [Wikipedia Index Lookup functions]
+# --- START: WIKIPEDIA LOOKUP FUNCTIONS ---
 def build_sp500_ticker_map(cache_duration_hours=24, force_refresh=False):
     """Builds or loads a mapping of S&P 500 company names to tickers from Wikipedia."""
     cache_file = "sp500_data.pkl"
@@ -1562,284 +1549,34 @@ def build_sp500_ticker_map(cache_duration_hours=24, force_refresh=False):
             response.raise_for_status()
             html_content = io.StringIO(response.text)
             tables = pd.read_html(html_content, flavor='lxml')
-            sp500_table = tables[0]
+            sp500_table = tables[0] # S&P 500 table is typically the first one
+            logging.info(f"S&P 500 table columns (raw): {sp500_table.columns.tolist()}") # Log columns
+            logging.info(f"S&P 500 table rows (raw): {len(sp500_table)}") # Log row count
+
             ticker_col = 'Symbol'
             name_col = 'Security'
-            scraped_ticker_map = {}
-            for _, row in sp500_table.iterrows():
-                ticker_val, name_val = row.get(ticker_col), row.get(name_col)
-                if isinstance(ticker_val, str) and isinstance(name_val, str) and ticker_val.strip() and name_val.strip():
-                    ticker_clean = ticker_val.strip().replace('.', '-')
-                    name_lower = name_val.strip().lower()
-                    name_cleaned = re.sub(r'\s+(inc|incorporated|corp|corporation|ltd|plc|co)\.?\b|\.$|,', '', name_lower, flags=re.IGNORECASE).strip()
-                    scraped_ticker_map[name_lower] = ticker_clean
-                    if name_cleaned != name_lower and name_cleaned not in scraped_ticker_map:
-                        scraped_ticker_map[name_cleaned] = ticker_clean
-            ticker_map = scraped_ticker_map
-            logging.info(f"Scraped {len(ticker_map)} S&P 500 entries.")
-        except Exception as e:
-            logging.error(f"Error fetching S&P 500 data: {e}")
-            return None
-    if ticker_map is not None:
-        # Expanded overrides for top 50 stocks and Apple
-        overrides = {
-            # Apple-specific mappings
-            "apple": "AAPL", "apple inc": "AAPL", "apple inc.": "AAPL",
-            # Top 50 stocks by market cap (approximated based on recent data)
-            "microsoft": "MSFT", "microsoft corporation": "MSFT",
-            "nvidia": "NVDA", "nvidia corporation": "NVDA",
-            "amazon": "AMZN", "amazon.com": "AMZN",
-            "meta": "META", "meta platforms": "META", "facebook": "META",
-            "alphabet": "GOOGL", "google": "GOOGL", "alphabet class c": "GOOG",
-            "tesla": "TSLA", "tesla inc": "TSLA",
-            "berkshire hathaway": "BRK-B", "berkshire hathaway inc": "BRK-B",
-            "jpmorgan chase": "JPM", "jpmorgan chase & co": "JPM",
-            "visa": "V", "visa inc": "V",
-            "walmart": "WMT", "walmart inc": "WMT",
-            "exxon mobil": "XOM", "exxon mobil corporation": "XOM",
-            "unitedhealth group": "UNH", "unitedhealth group incorporated": "UNH",
-            "mastercard": "MA", "mastercard incorporated": "MA",
-            "procter & gamble": "PG", "procter & gamble company": "PG",
-            "johnson & johnson": "JNJ",
-            "home depot": "HD", "home depot inc": "HD",
-            "costco wholesale": "COST", "costco wholesale corporation": "COST",
-            "abbvie": "ABBV", "abbvie inc": "ABBV",
-            "chevron": "CVX", "chevron corporation": "CVX",
-            "merck": "MRK", "merck & co inc": "MRK",
-            "coca-cola": "KO", "coca-cola company": "KO",
-            "pepsico": "PEP", "pepsico inc": "PEP",
-            "broadcom": "AVGO", "broadcom inc": "AVGO",
-            "thermo fisher scientific": "TMO", "thermo fisher scientific inc": "TMO",
-            "cisco systems": "CSCO", "cisco": "CSCO",
-            "accenture": "ACN", "accenture plc": "ACN",
-            "mcdonald's": "MCD", "mcdonald's corporation": "MCD",
-            "pfizer": "PFE", "pfizer inc": "PFE",
-            "salesforce": "CRM", "salesforce inc": "CRM",
-            "bank of america": "BAC", "bank of america corporation": "BAC",
-            "netflix": "NFLX", "netflix inc": "NFLX",
-            "adobe": "ADBE", "adobe inc": "ADBE",
-            "advanced micro devices": "AMD", "amd": "AMD",
-            "linde": "LIN", "linde plc": "LIN",
-            "qualcomm": "QCOM", "qualcomm incorporated": "QCOM",
-            "intel": "INTC", "intel corporation": "INTC",
-            "wells fargo": "WFC", "wells fargo & company": "WFC",
-            "oracle": "ORCL", "oracle corporation": "ORCL",
-            "applied materials": "AMAT", "applied materials inc": "AMAT",
-            "union pacific": "UNP", "union pacific corporation": "UNP",
-            "texas instruments": "TXN", "texas instruments incorporated": "TXN",
-            "at&t": "T", "at&t inc": "T",
-            "verizon communications": "VZ", "verizon": "VZ",
-            "morgan stanley": "MS", "morgan stanley": "MS",
-            "goldman sachs": "GS", "goldman sachs group inc": "GS",
-            "comcast": "CMCSA", "comcast corporation": "CMCSA",
-            "charles schwab": "SCHW", "charles schwab corporation": "SCHW",
-            "intuit": "INTU", "intuit inc": "INTU",
-            "amgen": "AMGN", "amgen inc": "AMGN",
-            "paypal": "PYPL", "paypal holdings": "PYPL"
-        }
-        ticker_map.update(overrides)
-        logging.info(f"S&P 500 map updated with {len(overrides)} overrides, total size: {len(ticker_map)}.")
-        if not loaded_from_cache or force_refresh:
-            try:
-                pd.to_pickle({'timestamp': time.time(), 'ticker_map': ticker_map}, cache_file)
-                logging.info(f"Saved S&P 500 map to cache.")
-            except Exception as e:
-                logging.warning(f"Warning: Could not write S&P 500 cache: {e}")
-    else:
-        logging.error("ERROR: S&P 500 Ticker map is None.")
-        return None
-    return ticker_map
 
-# ... (previous imports and code remain unchanged) ...
-
-def build_sp500_ticker_map(cache_duration_hours=24, force_refresh=False):
-    """Builds or loads a mapping of S&P 500 company names to tickers from Wikipedia."""
-    cache_file = "sp500_data.pkl"
-    ticker_map = None
-    loaded_from_cache = False
-    logging.info(f"Checking S&P 500 cache (file: {cache_file}, force_refresh={force_refresh}).")
-    if not force_refresh and os.path.exists(cache_file):
-        try:
-            cache_data = pd.read_pickle(cache_file)
-            last_fetch_time = cache_data.get('timestamp', 0)
-        except Exception as e:
-            logging.warning(f"S&P 500 cache read error: {e}.")
-            last_fetch_time = 0
-        if (time.time() - last_fetch_time) / 3600 < cache_duration_hours:
-            logging.info("Using cached S&P 500 data.")
-            ticker_map = cache_data.get('ticker_map')
-            loaded_from_cache = bool(ticker_map)
-        else:
-            logging.info("S&P 500 cache expired.")
-    if ticker_map is None:
-        logging.info("Fetching fresh S&P 500 data.")
-        url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
-        try:
-            headers = {'User-Agent': 'Mozilla/5.0 (compatible; FinancialBot/1.0; +http://example.com/bot)'}
-            response = requests.get(url, headers=headers, timeout=15)
-            response.raise_for_status()
-            html_content = io.StringIO(response.text)
-            tables = pd.read_html(html_content, flavor='lxml')
-            sp500_table = tables[0]
-            ticker_col = 'Symbol'
-            name_col = 'Security'
-            scraped_ticker_map = {}
-            for _, row in sp500_table.iterrows():
-                ticker_val, name_val = row.get(ticker_col), row.get(name_col)
-                if isinstance(ticker_val, str) and isinstance(name_val, str) and ticker_val.strip() and name_val.strip():
-                    ticker_clean = ticker_val.strip().replace('.', '-')
-                    name_lower = name_val.strip().lower()
-                    name_cleaned = re.sub(r'\s+(inc|incorporated|corp|corporation|ltd|plc|co)\.?\b|\.$|,', '', name_lower, flags=re.IGNORECASE).strip()
-                    scraped_ticker_map[name_lower] = ticker_clean
-                    if name_cleaned != name_lower and name_cleaned not in scraped_ticker_map:
-                        scraped_ticker_map[name_cleaned] = ticker_clean
-            ticker_map = scraped_ticker_map
-            logging.info(f"Scraped {len(ticker_map)} S&P 500 entries.")
-        except Exception as e:
-            logging.error(f"Error fetching S&P 500 data: {e}")
-            return None
-    if ticker_map is not None:
-        # Expanded overrides for top 50 stocks and Apple
-        overrides = {
-            # Apple-specific mappings
-            "apple": "AAPL", "apple inc": "AAPL", "apple inc.": "AAPL",
-            # Top 50 stocks by market cap (approximated based on recent data)
-            "microsoft": "MSFT", "microsoft corporation": "MSFT",
-            "nvidia": "NVDA", "nvidia corporation": "NVDA",
-            "amazon": "AMZN", "amazon.com": "AMZN",
-            "meta": "META", "meta platforms": "META", "facebook": "META",
-            "alphabet": "GOOGL", "google": "GOOGL", "alphabet class c": "GOOG",
-            "tesla": "TSLA", "tesla inc": "TSLA",
-            "berkshire hathaway": "BRK-B", "berkshire hathaway inc": "BRK-B",
-            "jpmorgan chase": "JPM", "jpmorgan chase & co": "JPM",
-            "visa": "V", "visa inc": "V",
-            "walmart": "WMT", "walmart inc": "WMT",
-            "exxon mobil": "XOM", "exxon mobil corporation": "XOM",
-            "unitedhealth group": "UNH", "unitedhealth group incorporated": "UNH",
-            "mastercard": "MA", "mastercard incorporated": "MA",
-            "procter & gamble": "PG", "procter & gamble company": "PG",
-            "johnson & johnson": "JNJ",
-            "home depot": "HD", "home depot inc": "HD",
-            "costco wholesale": "COST", "costco wholesale corporation": "COST",
-            "abbvie": "ABBV", "abbvie inc": "ABBV",
-            "chevron": "CVX", "chevron corporation": "CVX",
-            "merck": "MRK", "merck & co inc": "MRK",
-            "coca-cola": "KO", "coca-cola company": "KO",
-            "pepsico": "PEP", "pepsico inc": "PEP",
-            "broadcom": "AVGO", "broadcom inc": "AVGO",
-            "thermo fisher scientific": "TMO", "thermo fisher scientific inc": "TMO",
-            "cisco systems": "CSCO", "cisco": "CSCO",
-            "accenture": "ACN", "accenture plc": "ACN",
-            "mcdonald's": "MCD", "mcdonald's corporation": "MCD",
-            "pfizer": "PFE", "pfizer inc": "PFE",
-            "salesforce": "CRM", "salesforce inc": "CRM",
-            "bank of america": "BAC", "bank of america corporation": "BAC",
-            "netflix": "NFLX", "netflix inc": "NFLX",
-            "adobe": "ADBE", "adobe inc": "ADBE",
-            "advanced micro devices": "AMD", "amd": "AMD",
-            "linde": "LIN", "linde plc": "LIN",
-            "qualcomm": "QCOM", "qualcomm incorporated": "QCOM",
-            "intel": "INTC", "intel corporation": "INTC",
-            "wells fargo": "WFC", "wells fargo & company": "WFC",
-            "oracle": "ORCL", "oracle corporation": "ORCL",
-            "applied materials": "AMAT", "applied materials inc": "AMAT",
-            "union pacific": "UNP", "union pacific corporation": "UNP",
-            "texas instruments": "TXN", "texas instruments incorporated": "TXN",
-            "at&t": "T", "at&t inc": "T",
-            "verizon communications": "VZ", "verizon": "VZ",
-            "morgan stanley": "MS", "morgan stanley": "MS",
-            "goldman sachs": "GS", "goldman sachs group inc": "GS",
-            "comcast": "CMCSA", "comcast corporation": "CMCSA",
-            "charles schwab": "SCHW", "charles schwab corporation": "SCHW",
-            "intuit": "INTU", "intuit inc": "INTU",
-            "amgen": "AMGN", "amgen inc": "AMGN",
-            "paypal": "PYPL", "paypal holdings": "PYPL"
-        }
-        ticker_map.update(overrides)
-        logging.info(f"S&P 500 map updated with {len(overrides)} overrides, total size: {len(ticker_map)}.")
-        if not loaded_from_cache or force_refresh:
-            try:
-                pd.to_pickle({'timestamp': time.time(), 'ticker_map': ticker_map}, cache_file)
-                logging.info(f"Saved S&P 500 map to cache.")
-            except Exception as e:
-                logging.warning(f"Warning: Could not write S&P 500 cache: {e}")
-    else:
-        logging.error("ERROR: S&P 500 Ticker map is None.")
-        return None
-    return ticker_map
-
-def build_nasdaq100_ticker_map(cache_duration_hours=24, force_refresh=False):
-    """Builds or loads a mapping of Nasdaq 100 company names to tickers from Wikipedia."""
-    cache_file = "nasdaq100_data.pkl"
-    ticker_map = None
-    loaded_from_cache = False
-    logging.info(f"Checking Nasdaq 100 cache (file: {cache_file}, force_refresh={force_refresh}).")
-    if not force_refresh and os.path.exists(cache_file):
-        try:
-            cache_data = pd.read_pickle(cache_file)
-            last_fetch_time = cache_data.get('timestamp', 0)
-        except Exception as e:
-            logging.warning(f"Nasdaq 100 cache read error: {e}.")
-            last_fetch_time = 0
-        if (time.time() - last_fetch_time) / 3600 < cache_duration_hours:
-            logging.info("Using cached Nasdaq 100 data.")
-            ticker_map = cache_data.get('ticker_map')
-            loaded_from_cache = bool(ticker_map)
-        else:
-            logging.info("Nasdaq 100 cache expired.")
-    if ticker_map is None:
-        logging.info("Fetching fresh Nasdaq 100 data.")
-        url = 'https://en.wikipedia.org/wiki/Nasdaq-100'
-        try:
-            headers = {'User-Agent': 'Mozilla/5.0 (compatible; FinancialBot/1.0; +http://example.com/bot)'}
-            response = requests.get(url, headers=headers, timeout=15)
-            response.raise_for_status()
-            html_content = io.StringIO(response.text)
-            tables = pd.read_html(html_content, flavor='lxml')
-            found_table = False
-            for i, df in enumerate(tables):
-                cols_lower = {str(col).lower() for col in df.columns}
-                has_ticker = any(t in cols_lower for t in ['ticker symbol', 'ticker', 'symbol'])
-                has_name = any(n in cols_lower for n in ['company', 'security'])
-                if has_ticker and has_name and len(df) > 95 and len(df) < 110:
-                    nasdaq_table = df
-                    logging.info(f"Found Nasdaq 100 table at index {i}.")
-                    found_table = True
-                    break
-            if not found_table:
-                raise IndexError("Could not find Nasdaq 100 table with expected columns and row count.")
-            ticker_col, name_col = None, None
-            possible_ticker_cols = ['Ticker Symbol', 'Ticker', 'Symbol']
-            possible_name_cols = ['Company', 'Security']
-            for col in nasdaq_table.columns:
-                col_str = str(col)
-                if col_str in possible_ticker_cols and ticker_col is None:
-                    ticker_col = col_str
-                if col_str in possible_name_cols and name_col is None:
-                    name_col = col_str
-            if not ticker_col or not name_col:
-                logging.error(f"Could not find Nasdaq 100 columns (looked for {possible_ticker_cols} and {possible_name_cols}). Found: {nasdaq_table.columns.tolist()}")
+            if ticker_col not in sp500_table.columns or name_col not in sp500_table.columns:
+                logging.error(f"Required columns '{ticker_col}' or '{name_col}' not found in S&P 500 table. Found: {sp500_table.columns.tolist()}")
                 return None
+
             scraped_ticker_map = {}
-            for _, row in nasdaq_table.iterrows():
+            for _, row in sp500_table.iterrows():
                 ticker_val, name_val = row.get(ticker_col), row.get(name_col)
                 if isinstance(ticker_val, str) and isinstance(name_val, str) and ticker_val.strip() and name_val.strip():
                     ticker_clean = ticker_val.strip().replace('.', '-')
                     name_lower = name_val.strip().lower()
                     name_cleaned = re.sub(r'\s+(inc|incorporated|corp|corporation|ltd|plc|co)\.?\b|\.$|,', '', name_lower, flags=re.IGNORECASE).strip()
                     scraped_ticker_map[name_lower] = ticker_clean
-                    if name_cleaned != name_lower and name_cleaned not in scraped_ticker_map:
+                    if name_cleaned and name_cleaned != name_lower and name_cleaned not in scraped_ticker_map:
                         scraped_ticker_map[name_cleaned] = ticker_clean
             ticker_map = scraped_ticker_map
-            logging.info(f"Scraped {len(ticker_map)} Nasdaq 100 entries.")
-        except requests.exceptions.RequestException as e:
-            logging.error(f"FATAL: Error fetching Nasdaq 100 URL '{url}': {e}")
-            return None
+            logging.info(f"Scraped {len(ticker_map)} S&P 500 entries before overrides.")
         except Exception as e:
-            logging.error(f"FATAL: Unexpected error during Nasdaq 100 fetch: {e}", exc_info=True)
+            logging.error(f"Error fetching S&P 500 data: {e}")
             return None
     if ticker_map is not None:
-        # Expanded overrides for top 50 stocks and Apple
+        # Expanded overrides for top 50 stocks and Apple + TSLA (as it's now in S&P 500 too)
         overrides = {
             # Apple-specific mappings
             "apple": "AAPL", "apple inc": "AAPL", "apple inc.": "AAPL",
@@ -1849,7 +1586,7 @@ def build_nasdaq100_ticker_map(cache_duration_hours=24, force_refresh=False):
             "amazon": "AMZN", "amazon.com": "AMZN",
             "meta": "META", "meta platforms": "META", "facebook": "META",
             "alphabet": "GOOGL", "google": "GOOGL", "alphabet class c": "GOOG",
-            "tesla": "TSLA", "tesla inc": "TSLA",
+            "tesla": "TSLA", "tesla inc": "TSLA", "tesla, inc.": "TSLA", # Added TSLA overrides here too
             "berkshire hathaway": "BRK-B", "berkshire hathaway inc": "BRK-B",
             "jpmorgan chase": "JPM", "jpmorgan chase & co": "JPM",
             "visa": "V", "visa inc": "V",
@@ -1896,21 +1633,19 @@ def build_nasdaq100_ticker_map(cache_duration_hours=24, force_refresh=False):
             "paypal": "PYPL", "paypal holdings": "PYPL"
         }
         ticker_map.update(overrides)
-        logging.info(f"Nasdaq 100 map updated with {len(overrides)} overrides, total size: {len(ticker_map)}.")
+        logging.info(f"S&P 500 map updated with {len(overrides)} overrides, total size: {len(ticker_map)}.")
+        logging.info(f"Sample S&P 500 mappings: {dict(list(ticker_map.items())[:5])}") # Log sample
         if not loaded_from_cache or force_refresh:
             try:
                 pd.to_pickle({'timestamp': time.time(), 'ticker_map': ticker_map}, cache_file)
-                logging.info(f"Saved Nasdaq 100 map to cache.")
+                logging.info(f"Saved S&P 500 map to cache.")
             except Exception as e:
-                logging.warning(f"Warning: Could not write Nasdaq 100 cache: {e}")
+                logging.warning(f"Warning: Could not write S&P 500 cache: {e}")
     else:
-        logging.error("ERROR: Nasdaq 100 Ticker map is None.")
+        logging.error("ERROR: S&P 500 Ticker map is None.")
         return None
     return ticker_map
 
-# ... (rest of the script remains unchanged) ...
-
-# ... (rest of the script remains unchanged) ...
 
 def build_nasdaq100_ticker_map(cache_duration_hours=24, force_refresh=False):
     """Builds or loads a mapping of Nasdaq 100 company names to tickers from Wikipedia."""
@@ -1943,6 +1678,12 @@ def build_nasdaq100_ticker_map(cache_duration_hours=24, force_refresh=False):
                 if not found_table: raise IndexError("Could not find Nasdaq 100 table with expected columns and row count.")
             except Exception as e: logging.error(f"Error reading Nasdaq 100 HTML: {e}."); return None
 
+            # --- Add logging for table columns and row count ---
+            if nasdaq_table is not None:
+                 logging.info(f"Nasdaq 100 table columns: {nasdaq_table.columns.tolist()}")
+                 logging.info(f"Nasdaq 100 table rows: {len(nasdaq_table)}")
+            # --- End logging ---
+
             ticker_col, name_col = None, None; possible_ticker_cols = ['Ticker Symbol', 'Ticker', 'Symbol']; possible_name_cols = ['Company', 'Security']
             for col in nasdaq_table.columns:
                 col_str = str(col)
@@ -1959,13 +1700,13 @@ def build_nasdaq100_ticker_map(cache_duration_hours=24, force_refresh=False):
                     name_lower = name_val.strip().lower();
                     name_cleaned = re.sub(r'\s+(inc|incorporated|corp|corporation|ltd|plc|co)\.?\b|\.$|,', '', name_lower, flags=re.IGNORECASE).strip()
                     scraped_ticker_map[name_lower] = ticker_clean
-                    if name_cleaned != name_lower and name_cleaned not in scraped_ticker_map: scraped_ticker_map[name_cleaned] = ticker_clean
-            ticker_map = scraped_ticker_map; logging.info(f"Scraped {len(ticker_map)} Nasdaq 100 entries.")
+                    if name_cleaned and name_cleaned != name_lower and name_cleaned not in scraped_ticker_map: scraped_ticker_map[name_cleaned] = ticker_clean
+            ticker_map = scraped_ticker_map; logging.info(f"Scraped {len(ticker_map)} Nasdaq 100 entries before overrides.")
         except requests.exceptions.RequestException as e: logging.error(f"FATAL: Error fetching Nasdaq 100 URL '{url}': {e}"); return None
         except Exception as e: logging.error(f"FATAL: Unexpected error during Nasdaq 100 fetch: {e}", exc_info=True); return None
 
     if ticker_map is not None:
-        # Add specific overrides (some overlap with S&P 500, ok)
+        # Add specific overrides (some overlap with S&P 500, ok) - Added TSLA overrides
         overrides = { "google": "GOOGL", "alphabet": "GOOGL", "alphabet class c": "GOOG", "alphabet inc.": "GOOGL",
                       "meta": "META", "facebook": "META", "meta platforms": "META", "fb": "META",
                       "amazon": "AMZN", "amazon.com": "AMZN",
@@ -1976,11 +1717,12 @@ def build_nasdaq100_ticker_map(cache_duration_hours=24, force_refresh=False):
                       "intel": "INTC", "intel corporation": "INTC",
                       "cisco": "CSCO", "cisco systems": "CSCO",
                       "adobe": "ADBE", "adobe inc.": "ADBE",
-                      "tesla": "TSLA", "tesla, inc.": "TSLA",
+                      "tesla": "TSLA", "tesla, inc.": "TSLA", "tesla inc": "TSLA", # Added these overrides
                       "microsoft": "MSFT", "microsoft corporation": "MSFT",
                       "apple": "AAPL", "apple inc.": "AAPL",
                     }
         ticker_map.update(overrides); logging.info(f"Nasdaq 100 map updated with overrides, size: {len(ticker_map)}.")
+        logging.info(f"Sample Nasdaq 100 mappings: {dict(list(ticker_map.items())[:5])}") # Log sample
         if not loaded_from_cache or force_refresh:
             try: pd.to_pickle({'timestamp': time.time(), 'ticker_map': ticker_map}, cache_file); logging.info(f"Saved Nasdaq 100 map to cache.")
             except Exception as e: logging.warning(f"Warning: Could not write Nasdaq 100 cache: {e}")
@@ -2016,7 +1758,7 @@ def get_ticker_from_combined_map(query, combined_map):
             # Also try cleaned version of the tricky output name if the direct map hit didn't work
             tricky_out_cleaned = re.sub(r'\s+(inc|incorporated|corp|corporation|ltd|plc|co)\.?\b|\.$|,', '', tricky_out, flags=re.IGNORECASE).strip()
             if tricky_out_cleaned != tricky_out:
-                 ticker = combined_map.get(tricky_out_cleaned) # FIX: Typo here, was trcky_out_cleaned, changed to tricky_out_cleaned
+                 ticker = combined_map.get(tricky_out_cleaned)
                  if ticker: logging.debug(f"Combined map specific trick + cleaned hit for '{query_lower}' -> '{tricky_out_cleaned}': {ticker}"); return ticker
 
 
@@ -2042,133 +1784,128 @@ def load_combined_ticker_map():
     logging.info("\n--- Merging Maps ---");
     combined_tickers = sp500_map.copy();
     combined_tickers.update(nasdaq100_map); # Nasdaq 100 entries will overwrite S&P 500 if there's overlap (e.g., Apple)
+    # --- Add logging for combined map size ---
     logging.info(f"Total entries in combined map: {len(combined_tickers)}");
+    # --- End logging ---
     logging.info(" Combined Ticker Map Ready " + "="*30 + "\n");
     return combined_tickers
 
-@st.cache_data(ttl=3600) # Cache Yahoo search results for 1 hour
-def lookup_ticker_by_company_name(query):
-    """Attempts to find a stock ticker for a given query (ticker or company name)."""
-    if not query or len(query.strip()) < 1: return None
-    search_term = query.strip(); logging.info(f"=== Starting Ticker Lookup for: '{search_term}' ===");
+# --- New helper function for the direct yf history check with retry ---
+@rate_limit_retry(max_attempts=3, initial_delay=5)
+def check_ticker_history_with_retry(ticker):
+    """Performs a yfinance history check for validation with rate limit retries."""
+    logging.info(f"Attempting yf history check for '{ticker}' (inside retry)")
+    ticker_obj = yf.Ticker(ticker)
+    # Check history for the last day - if it exists, it's likely a valid symbol
+    hist = ticker_obj.history(period="1d", interval="1d")
+    if hist is None or hist.empty:
+        # Raise an error if history is empty, so the retry decorator handles it
+        logging.warning(f"yf history check for '{ticker}' returned empty history.")
+        raise ValueError(f"No history found for ticker {ticker}")
+    logging.info(f"yf history check for '{ticker}' successful.")
+    return hist # Return hist if successful
 
-    # Step 1: Check if the query itself is a plausible ticker
-    direct_ticker_attempt = search_term.upper().replace('$', '');
-    # A plausible ticker is 1-10 alphanumeric chars, allows hyphens/dots (for international/OTC),
-    # but filter out long strings that are only digits (unlikely tickers).
-    is_potential_ticker = bool(re.fullmatch(r'[A-Z0-9\-\.]{1,10}', direct_ticker_attempt)) and not (direct_ticker_attempt.isdigit() and len(direct_ticker_attempt) > 4)
 
-    if is_potential_ticker:
-        logging.info(f"Step 1: Query '{search_term}' looks like ticker '{direct_ticker_attempt}'. Direct yf check...")
-        try:
-            # Use a quick history check as info() can be slow or fail on invalid symbols
-            ticker_obj = yf.Ticker(direct_ticker_attempt);
-            # Check history for the last day - if it exists, it's likely a valid symbol
-            hist = ticker_obj.history(period="1d", interval="1d")
-            if not hist.empty:
-                # Optional: Check info to filter out non-EQUITY/ETF if needed, but history is strong validation
-                # info = ticker_obj.info # Could add this back if stricter filtering is desired
-                # if info and info.get('quoteType') and info.get('quoteType') not in ['EQUITY', 'ETF']:
-                #      logging.info(f"Step 1 FAILED: Ticker '{direct_ticker_attempt}' exists but not supported type (Type: {info.get('quoteType')}).")
-                #      # Fall through to next steps
-                # else:
-                logging.info(f"Step 1 SUCCESS (via history): Direct yf '{direct_ticker_attempt}' confirmed (history found)."); return direct_ticker_attempt.upper()
-            else:
-                 logging.info(f"Step 1 FAILED: Direct yf check '{direct_ticker_attempt}' - no history.")
-                 # Fall through to next steps
-        except Exception as e:
-             # Catch exceptions during yf.Ticker or history call
-             logging.warning(f"Step 1 EXCEPTION: Direct yf check failed for '{direct_ticker_attempt}': {e}.")
-             # Fall through to next steps
-    else: logging.info(f"Step 1: Query '{search_term}' not formatted like ticker.")
-
-    # Step 2: Check Combined S&P/Nasdaq Map
-    logging.info(f"Step 2: Checking Combined S&P/Nasdaq Map for '{search_term}'...")
-    map_ticker = get_ticker_from_combined_map(search_term, COMBINED_TICKERS)
-    if map_ticker:
-         # Verify the map result with yfinance history as a safety check
-         try:
-             yf_map_ticker = yf.Ticker(map_ticker)
-             hist_map = yf_map_ticker.history(period="1d", interval="1d")
-             if not hist_map.empty:
-                 logging.info(f"Step 2 SUCCESS: Found '{search_term}' in Combined Map: {map_ticker}, yf history confirmed.");
-                 # Optional: Filter out non-EQUITY/ETF from map results too
-                 # info_map = yf_map_ticker.info
-                 # if info_map and info_map.get('quoteType', '').upper() not in ['EQUITY', 'ETF']:
-                 #      logging.warning(f"Map result {map_ticker} is not EQUITY/ETF (Type: {info_map.get('quoteType')}). Continuing lookup.")
-                 #      # Fall through to step 3
-                 # else:
-                 return map_ticker.upper()
-             else:
-                 logging.warning(f"Step 2 FAILED: Map result '{map_ticker}' from '{search_term}' not confirmed by yf history.")
-                 # Fall through to step 3
-         except Exception as e:
-              logging.warning(f"Step 2 EXCEPTION: yf check on map result '{map_ticker}' failed: {e}.")
-              # Fall through to step 3
-    else: logging.info(f"Step 2 FAILED: Query '{search_term}' not in combined map.")
-
-    
-# Step 3: Fallback to Yahoo Finance Search API
-import requests
+# --- Rewritten fallback_yahoo_search function ---
+# @st.cache_data(ttl=3600) # Caching applied in lookup_ticker_by_company_name caller
 def fallback_yahoo_search(search_term):
+    logging.info(f"Step 3: Falling back to Yahoo Finance Search API for '{search_term}'...")
     try:
-        res = requests.get("https://query1.finance.yahoo.com/v1/finance/search", params={"q": search_term}, timeout=10)
-        res.raise_for_status()
-        quotes = res.json().get("quotes", [])
-        for quote in quotes:
-            if quote.get("quoteType") in ["EQUITY", "ETF"]:
-                return quote.get("symbol")
-        return None
-    except Exception as e:
-        logging.warning(f"Step 3 EXCEPTION: {e}")
-        return None
-        # Define allowed quote types and exchanges more explicitly
+        url = "https://query1.finance.yahoo.com/v1/finance/search"
+        # Increased quotesCount for more potential matches, filtered later
+        params = {"q": search_term, "quotesCount": 20, "newsCount": 0}
+        # Use a descriptive User-Agent
+        headers = {'User-Agent': 'Mozilla/5.0 (compatible; FinancialBot/1.0; +https://yourwebsite.com/financialbot)'} # Replace with your bot info/website
+        res = requests.get(url, params=params, headers=headers, timeout=10)
+        res.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+        data = res.json()
+
+        quotes = data.get("quotes", [])
         allowed_quote_types = ["EQUITY", "ETF"]
         # Add common major exchanges suffix or exchDisp
-        allowed_exchanges_suffix = ['.TA', '.TL', '.AS', '.BR', '.DE', '.PA', '.L', '.TO', '.V', '.HE', '.SW'] # TA, TLV, Euronext, XTRA, PAR, LSE, TSX, TSXV, HEX, EBS
-        allowed_exchanges_disp = ["TLV", "TASE", "NMS", "NYQ", "ASE", "AMS", "BRU", "GER", "PAR", "LSE", "TOR", "VAN", "HEL", "EBS"] # Nasdaq, NYSE, Amex, Euronext etc.
+        # Expanded list of allowed exchanges/suffixes
+        allowed_exchanges_suffix = ['.TA', '.TL', '.AS', '.BR', '.DE', '.PA', '.L', '.TO', '.V', '.HE', '.SW', '.OL', '.VI', '.IC', '.IR', '.MI', '.LS', '.MC', '.VX', '.ST', '.CO', '.TR'] # Added OSL, VIE, ICE, IRL, MIL, LIS, MAD, SWX, STO, CPH, IST
+        allowed_exchanges_disp = ["TLV", "TASE", "NMS", "NYQ", "ASE", "NASDAQ", "NYSE", "AMEX", "BATS", "AMS", "BRU", "GER", "PAR", "LSE", "TOR", "VAN", "HEL", "EBS", "OSL", "VIE", "ICE", "IRL", "MIL", "LIS", "MAD", "SWX", "STO", "CPH", "IST"]
+
+        highest_score = -1 # Start below 0 so any valid score is higher
+        best_match = None
+        search_term_lower = search_term.lower()
+
+        logging.debug(f"Step 3: Found {len(quotes)} raw search results.")
 
         for item in quotes:
-            symbol = item.get("symbol"); quote_type = item.get("quoteType"); score = item.get("score", 0) or 0; # Use 0 if score is None
-            short_name = item.get("shortname", "").lower(); long_name = item.get("longname", "").lower(); exch_disp = item.get("exchDisp", "")
+            symbol = item.get("symbol")
+            quote_type = item.get("quoteType")
+            score = item.get("score", 0) or 0 # Use 0 if score is None or missing
+            short_name = item.get("shortname", "").lower()
+            long_name = item.get("longname", "").lower()
+            exch_disp = item.get("exchDisp", "")
             is_yahoo_finance = item.get("isYahooFinance", False) # Prioritize results flagged as primary
-            
-            # Basic filters: Valid symbol, allowed type, not an index/future/option/currency
+
+            # Basic filters: Valid symbol, allowed type, not an index/future/option/currency/mutual fund
             if not symbol or quote_type not in allowed_quote_types or '^' in symbol or any(ft in quote_type.upper() for ft in ['FUTURE', 'INDEX', 'CURRENCY', 'OPTION', 'MUTUALFUND']):
                  logging.debug(f"Step 3 Filtered (Type/Symbol): {symbol} ({quote_type})"); continue
 
             # Exchange filter: must be a US exchange or one of the explicitly allowed international ones
+            is_allowed_exchange = False
             if '.' in symbol:
                  suffix = '.' + symbol.split('.')[-1].upper()
-                 if suffix not in allowed_exchanges_suffix and exch_disp not in allowed_exchanges_disp:
-                      logging.debug(f"Step 3 Filtered (Exchange Suffix/Disp: {suffix}/{exch_disp}): {symbol}"); continue
-            elif exch_disp not in ["NMS", "NYQ", "ASE", "NASDAQ", "NYSE", "AMEX", "BATS"]: # Assume US exchange if no dot, check common US displays
-                 logging.debug(f"Step 3 Filtered (US Exchange Disp: {exch_disp}): {symbol}"); continue
+                 if suffix in allowed_exchanges_suffix: is_allowed_exchange = True
+            # Also check exchDisp for both US and international listings
+            if exch_disp in allowed_exchanges_disp or exch_disp in ["NMS", "NYQ", "ASE", "NASDAQ", "NYSE", "AMEX", "BATS"]:
+                 is_allowed_exchange = True
+
+            if not is_allowed_exchange:
+                 logging.debug(f"Step 3 Filtered (Exchange Suffix/Disp: {symbol.split('.')[-1].upper() if '.' in symbol else 'N/A'}/{exch_disp}): {symbol}"); continue
 
 
-            # Calculate a relevance score
+            # Calculate a relevance score - refined scoring logic
             current_score = score # Start with Yahoo's score
-            if search_term_lower == short_name: current_score += 1000 # Exact name match is very high
-            elif search_term_lower == long_name: current_score += 500
-            # Partial matches - penalize shorter query matches in longer names
+
+            # Bonus for exact name matches (case-insensitive)
+            if search_term_lower == short_name: current_score += 2000 # Strongest match
+            elif search_term_lower == long_name: current_score += 1000
+            # Bonus for exact ticker match (case-insensitive)
+            if search_term_lower.upper() == symbol.upper(): current_score += 1500 # Very strong match
+
+            # Bonus for starts with name matches
+            if short_name.startswith(search_term_lower): current_score += 500
+            elif long_name.startswith(search_term_lower): current_score += 250
+
+            # Bonus for contains name matches, weighted by length ratio
             if short_name and search_term_lower in short_name: current_score += (len(search_term_lower) / len(short_name)) * 100
             elif long_name and search_term_lower in long_name: current_score += (len(search_term_lower) / len(long_name)) * 50
-            # Give bonus for exact ticker match
-            if search_term_lower.upper() == symbol.upper(): current_score += 200
+
             # Bonus for primary Yahoo Finance listing
-            if is_yahoo_finance: current_score += 10
+            if is_yahoo_finance: current_score += 50
+
+            # Penalize indices/futures/etc. even if they somehow slipped filters (belt-and-suspenders)
+            if any(ft in quote_type.upper() for ft in ['FUTURE', 'INDEX', 'CURRENCY', 'OPTION', 'MUTUALFUND']):
+                 current_score -= 500 # Large penalty
+
+            # Small bonus for US exchanges if relevant (can be tuned)
+            if exch_disp in ["NMS", "NYQ", "ASE", "NASDAQ", "NYSE", "AMEX", "BATS"]:
+                 current_score += 5
 
             logging.debug(f"Step 3 Candidate: {symbol} ({quote_type}, {exch_disp}), Score: {current_score:.2f}, Names: '{short_name}'/'{long_name}'")
 
             if current_score > highest_score:
                 highest_score = current_score; best_match = symbol
 
-        if best_match: logging.info(f"Step 3 SUCCESS: Best match from Fallback Search (Score: {highest_score:.2f}): {best_match}"); return best_match.upper()
-        else: logging.info(f"Step 3 FAILED: No suitable EQUITY/ETF found via Fallback Search."); return None
+        if best_match and highest_score > 0: # Only return a match if the score is positive (i.e. better than initial -1)
+            logging.info(f"Step 3 SUCCESS: Best match from Fallback Search (Score: {highest_score:.2f}): {best_match}"); return best_match.upper()
+        else:
+            logging.info(f"Step 3 FAILED: No suitable EQUITY/ETF found via Fallback Search (best score {highest_score:.2f})."); return None
 
-    except Exception as e: logging.warning(f"Step 3 EXCEPTION: Fallback search failed: {e}", exc_info=False); return None # Don't log stack trace for common search errors
-
-    finally: logging.info(f"=== Finished Ticker Lookup for: '{search_term}' ===")
+    except requests.exceptions.RequestException as e:
+        logging.warning(f"Step 3 EXCEPTION (Request): Fallback search failed: {e}")
+        return None
+    except json.JSONDecodeError:
+        logging.warning(f"Step 3 EXCEPTION (JSON): Fallback search received invalid JSON.")
+        return None
+    except Exception as e:
+        logging.warning(f"Step 3 EXCEPTION (Other): Fallback search failed: {e}", exc_info=False) # Don't log stack trace for common search errors
+        return None
 
 
 # --- Load Combined Ticker Map ---
@@ -2221,25 +1958,167 @@ for msg in st.session_state.messages:
         st.markdown(str(msg["content"]), unsafe_allow_html=True)
 
 # --- Ticker Extraction ---
-# Added more common non-ticker words
+# Added more common non-ticker words + some TA/finance concepts
 FORBIDDEN_TICKERS = {"TELL", "LOVE", "LIFE", "SOLO", "PLAY", "YOU", "REAL", "CASH", "WORK", "HOPE", "GOOD", "SAFE", "FAST", "COOK", "HUGE", "YOLO", "BOOM", "DUDE", "WISH", "ME", "ARE", "IS", "THE", "FOR", "AND", "NOW", "SEE", "CAN", "HAS", "WAS", "BUY", "SELL", "ALL", "ONE", "TWO", "BIG", "NEW", "OLD", "TOP", "LOW", "HIGH", "DATA", "FREE", "NEWS", "RISK", "CHART", "ETF", "FUND", "INDEX", "STOCK", "SHARES", "PRICE", "TRADE", "HOLD", "EXIT", "ENTRY","WHAT","ABOUT","ME","SENTIMENT","RISK","surge", "plunge", "spike", "dip", "correction", "crash", "rally", "breakout", "reversal", "pullback", "capital", "liquidity", "float", "burn rate", "runway", "dry powder",
  "trade", "order", "fill", "execution", "volume", "spread", "slippage", "scalping",
  "bullish", "bearish", "FOMO", "HODL", "panic sell", "greed", "fear",
  "investor", "trader", "market maker", "broker", "institutional investor",
  "drawdown", "stop-loss", "risk/reward", "volatility", "leverage",
- "earnings", "PE ratio", "support", "resistance", "RSI", "MACD", "candlestick", "volume profile"}
+ "earnings", "PE ratio", "support", "resistance", "RSI", "MACD", "candlestick", "volume profile",
+ "forecast", "prediction", "projection", "technical", "fundamental", "analysis",
+ "average", "moving", "simple", "exponential", "deviation", "standard", "beta",
+ "dividend", "yield", "cap", "market", "sector", "industry", "economic", "inflation", "interest", "rates",
+ "report", "statement", "balance", "income", "cashflow", "profit", "revenue", "asset", "liability", "equity",
+ "bond", "treasury", "future", "option", "currency", "commodity", "gold", "oil",
+ "vix", "cpi", "fed", "federal", "reserve", "ecb"}
 def extract_tickers(text):
     """Extracts potential ticker symbols (prefixed with $) or standalone words that might be tickers."""
     # Find words that look like tickers, potentially prefixed with $
-    potential_candidates = re.findall(r"(?<![a-zA-Z0-9])(?:[$])?([A-Z0-9\-\.]{1,10})\b", text, re.IGNORECASE)
+    # Relaxed regex slightly to allow more potential symbols, relying more on subsequent lookup validation
+    potential_candidates = re.findall(r"(?<![a-zA-Z0-9_])(?:[$])?([A-Za-z0-9\-\.]{1,10})\b", text, re.IGNORECASE)
     # Remove duplicates, clean up, filter by length and the forbidden list
-    clean_tickers = [t.upper().replace('$', '') for t in potential_candidates if t and len(t.replace('$','')) >= 1 and len(t.replace('$','')) <= 10 and not t.replace('$','').isdigit()] # Filter out pure numbers
-    unique_clean = [t for t in clean_tickers if t.upper() not in FORBIDDEN_TICKERS] # Filter forbidden words
-    # Add specific checks for valid single-letter tickers if needed, but YF usually handles 'T'
+    # Ensure ticker length is >= 1 and <= 10 after cleaning '$'
+    clean_tickers = [t.upper().replace('$', '') for t in potential_candidates if t and 1 <= len(t.replace('$','')) <= 10 and not t.replace('$','').isdigit()] # Filter out pure numbers
+    # Filter forbidden words - apply uppercase to comparison
+    unique_clean = [t for t in clean_tickers if t not in FORBIDDEN_TICKERS]
+    # Final deduplication preserving order (optional but good practice)
     seen = set(); unique_clean_deduped = [t for t in unique_clean if not (t in seen or seen.add(t))]
 
     logging.info(f"Extracted potential ticker candidates: {potential_candidates}, filtered: {unique_clean_deduped} from text: '{text}'");
     return unique_clean_deduped
+
+
+@st.cache_data(ttl=3600) # Cache Yahoo search results for 1 hour
+def lookup_ticker_by_company_name(query):
+    """Attempts to find a stock ticker for a given query (ticker or company name)."""
+    if not query or len(query.strip()) < 1: return None
+    search_term = query.strip(); logging.info(f"=== Starting Ticker Lookup for: '{search_term}' ===");
+
+    # Step 1: Check if the query itself is a plausible ticker
+    direct_ticker_attempt = search_term.upper().replace('$', '').strip();
+    # A plausible ticker is 1-10 alphanumeric chars, allows hyphens/dots (for international/OTC),
+    # but filter out long strings that are only digits (unlikely tickers).
+    # Also filter against common forbidden words immediately
+    is_potential_ticker = bool(re.fullmatch(r'[A-Z0-9\-\.]{1,10}', direct_ticker_attempt)) and not (direct_ticker_attempt.isdigit() and len(direct_ticker_attempt) > 4) and direct_ticker_attempt not in FORBIDDEN_TICKERS
+
+    if is_potential_ticker:
+        logging.info(f"Step 1: Query '{search_term}' looks like ticker '{direct_ticker_attempt}'. Direct yf check with retry...")
+        try:
+            # Use the decorated helper function for the history check
+            hist = check_ticker_history_with_retry(direct_ticker_attempt)
+            # If check_ticker_history_with_retry returns without raising, history was found
+            # Note: check_ticker_history_with_retry already logs success/warning internally
+
+            # Optional: Check info to filter out non-EQUITY/ETF if stricter filtering needed,
+            # but history is a strong validation for existence. Let's add a quick info check here
+            # WITHOUT retry, just one attempt, primarily for quoteType filtering.
+            try:
+                quick_info = yf.Ticker(direct_ticker_attempt).info
+                if quick_info and quick_info.get('quoteType', '').upper() not in ['EQUITY', 'ETF']:
+                     logging.warning(f"Step 1 FAILED: Ticker '{direct_ticker_attempt}' exists but not supported type (Type: {quick_info.get('quoteType')}).")
+                     # Fall through to next steps
+                else:
+                     logging.info(f"Step 1 SUCCESS: Direct yf '{direct_ticker_attempt}' confirmed via history (and optional type check).")
+                     return direct_ticker_attempt.upper()
+            except Exception as info_e:
+                 # Log info fetch error but proceed if history check passed
+                 logging.warning(f"Step 1 INFO check failed for '{direct_ticker_attempt}': {info_e}. History check passed, assuming valid.")
+                 return direct_ticker_attempt.upper()
+
+
+        except ValueError as ve: # Catch the specific error raised by check_ticker_history_with_retry on final failure
+             logging.warning(f"Step 1 FAILED: Direct yf check '{direct_ticker_attempt}' - {ve} (after retries).")
+             # Fall through to next steps
+        except Exception as e: # Catch any other unexpected errors from the decorated function
+             logging.warning(f"Step 1 EXCEPTION: Direct yf check failed for '{direct_ticker_attempt}': {e}.")
+             # Fall through to next steps
+    else: logging.info(f"Step 1: Query '{search_term}' not formatted like plausible ticker or is forbidden word.")
+
+    # Step 2: Check Combined S&P/Nasdaq Map
+    # Only check map if query is longer than a typical ticker (avoid ambiguous 1-3 letter lookups)
+    if len(search_term) > 4 or '-' in search_term or ' ' in search_term:
+        logging.info(f"Step 2: Checking Combined S&P/Nasdaq Map for '{search_term}'...")
+        map_ticker = get_ticker_from_combined_map(search_term, COMBINED_TICKERS)
+        if map_ticker:
+            # Verify the map result with yfinance history as a safety check (using retry helper)
+            try:
+                hist_map = check_ticker_history_with_retry(map_ticker)
+                # If history check passes, return the map ticker
+                # Optional: Add quick info check here as well if stricter filtering is desired
+                logging.info(f"Step 2 SUCCESS: Found '{search_term}' in Combined Map: {map_ticker}, yf history confirmed.");
+                return map_ticker.upper()
+            except ValueError as ve: # Catch the specific error raised by history check on final failure
+                 logging.warning(f"Step 2 FAILED: Map result '{map_ticker}' from '{search_term}' not confirmed by yf history (after retries). {ve}")
+                 # Fall through to step 3
+            except Exception as e: # Catch any other unexpected errors
+                 logging.warning(f"Step 2 EXCEPTION: yf check on map result '{map_ticker}' failed: {e}.")
+                 # Fall through to step 3
+        else:
+             logging.info(f"Step 2 FAILED: Query '{search_term}' not in combined map.")
+    else:
+        logging.info(f"Step 2: Skipping Combined Map check for short query '{search_term}'.")
+
+
+    # Step 3: Fallback to Yahoo Finance Search API
+    # Pass the task to the rewritten function
+    logging.info(f"Step 3: Attempting Fallback Yahoo Finance Search API for '{search_term}'...")
+    fallback_match = fallback_yahoo_search(search_term)
+
+    if fallback_match:
+        # Optional: Verify fallback match with history check?
+        # This adds latency but increases confidence. Let's skip for speed after a search API hit,
+        # assuming the search API is somewhat reliable for EQUITY/ETF types.
+        logging.info(f"Step 3 SUCCESS: Found match '{fallback_match}' via Fallback Search.")
+        return fallback_match.upper()
+    else:
+        logging.info(f"Step 3 FAILED: No suitable match found via Fallback Search.")
+        return None
+
+    finally: logging.info(f"=== Finished Ticker Lookup for: '{search_term}' ===")
+
+
+# --- Load Combined Ticker Map ---
+COMBINED_TICKERS = load_combined_ticker_map()
+
+# --- Chat Management ---
+if "messages" not in st.session_state: st.session_state.messages = []
+if "predefined_question" not in st.session_state: st.session_state.predefined_question = None
+
+# --- UI Elements ---
+# Updated Title
+st.markdown('<h1 style="text-align: left;">📈 Financial Chat, Risk Score, News & Forecasting</h1>', unsafe_allow_html=True)
+# Updated description
+st.markdown(f'<p style="text-align: left; font-size: small;"><br>Ask about stocks ($AAPL, Microsoft), compare, or discuss finance. Includes Dynamic Risk Score, Recent News Sentiment (Multi-Source/{NEWS_DAYS_BACK}d/VADER), and ETS Price Forecasting (Calculated). No charts or technical scans.</p>', unsafe_allow_html=True)
+
+with st.sidebar:
+    st.image("https://streamlit.io/images/brand/streamlit-mark-color.png", width=50)
+    st.markdown("## Examples")
+    # Updated MENU_OPTIONS - removed Scan Signals
+    MENU_OPTIONS = {
+        "🔍 Stock Info": ["What's up with $TSLA?", "$KO", "$TEVA", "MSFT data?", "3M Company info?"],
+        "📊 TA Concepts": ["What is SMA?", "Explain Moving Averages?", "What is Support/Resistance?", "Candlesticks?", "What are technical indicators?"], # Kept TA concepts
+        "⚖️ Risk": [" $AMD?", "Explain the risk score model", " $TQQQ?", " GOOG?"],
+        "📰 News Sentiment": ["News for $MSFT?", " News for $NVDA?", "News for for META?"],
+        "📈 ETS Forecast": ["Forecast $AAPL price", "What's the ETS forecast for $MSFT?", "Price projection for $GOOG?"],
+        "💼 Portfolio": ["How to diversify?", "Risks of single stocks?"],
+        "📰 Market/General": ["Impact of interest rates?", "Inflation effect?", "What are ETFs?"],
+    }
+    for category, questions in MENU_OPTIONS.items():
+        # Expanded default categories adjusted
+        is_expanded = (category in ["🔍 Stock Info", "⚖️ Risk", "📰 News Sentiment", "📈 ETS Forecast"])
+        with st.expander(f"**{category}**", expanded=is_expanded):
+            for i, q in enumerate(questions):
+                safe_category = re.sub(r'\W+', '', category); button_key = f"menu_{safe_category}_{i}"
+                if st.button(q, key=button_key, use_container_width=True): st.session_state.predefined_question = q; st.rerun() # Use st.rerun()
+
+    st.caption("Click a question to ask."); st.divider(); st.info("Enter a ticker symbol ($GOOGL) or company name (Microsoft, 3M) for specific data."); st.divider()
+
+    # Display API Key warnings in sidebar
+    # Riskfolio is no longer used, so no need to warn about it
+    # if not RISKFOLIO_AVAILABLE: st.warning("Riskfolio-Lib not found. Some advanced risk factors/methods disabled.", icon="⚠️")
+    # API key checks are done at the start, assuming they stop the app if critical keys are missing/invalid.
+    # Optional: Display warnings here if keys *were* provided but were invalid, if the app didn't stop.
+    # For now, relying on the initial st.error and st.stop() is sufficient.
 
 
 # --- User Input Handling ---
@@ -2307,10 +2186,23 @@ if user_input_triggered:
 
 
             # Only use the potential name part if it seems like a company name (not just a financial term)
-            finance_terms_general = {"stock", "share", "company", "ticker", "market", "index", "etf", "bond", "risk", "volatility", "prediction", "news", "sentiment", "scan", "compare", "forecast", "projection", "average", "moving", "relative", "strength"}
+            # Refined check: is it just one word that is a forbidden term? Or a very short phrase of forbidden terms?
+            finance_terms_general_set = set(FORBIDDEN_TICKERS) # Use the set for faster lookups
             potential_name_lower = potential_name_part.lower() if potential_name_part else None
-            if potential_name_lower and len(potential_name_lower) > 1 and potential_name_lower != 'me' and not any(term in potential_name_lower for term in finance_terms_general):
-                 lookup_query = potential_name_part; logging.info(f"Trying potential name part '{lookup_query}' for name lookup after '{found_prefix or ''}' prefix.")
+            if potential_name_lower:
+                 # Check if the entire potential name is a forbidden term
+                 is_just_forbidden_word = potential_name_lower in finance_terms_general_set
+                 # Check if the potential name is a short phrase where all words are forbidden terms
+                 is_short_phrase_of_forbidden = False
+                 potential_words = potential_name_lower.split()
+                 if 1 < len(potential_words) <= 3 and all(word in finance_terms_general_set for word in potential_words):
+                     is_short_phrase_of_forbidden = True
+
+                 if not is_just_forbidden_word and not is_short_phrase_of_forbidden:
+                      lookup_query = potential_name_part; logging.info(f"Trying potential name part '{lookup_query}' for name lookup after '{found_prefix or ''}' prefix.")
+                 else:
+                      logging.info(f"Potential name part '{potential_name_part}' looks like a financial term or forbidden phrase. Skipping ticker lookup based on name part.")
+
             else:
                  logging.info("No obvious ticker or plausible name part found. Skipping ticker lookup.")
 
@@ -2322,14 +2214,15 @@ if user_input_triggered:
             try: validated_ticker = lookup_ticker_by_company_name(lookup_query)
             except Exception as lookup_err:
                 logging.error(f"Ticker lookup function failed: {lookup_err}", exc_info=True)
-                validated_ticker = None
+                validated_ticker = None # Ensure validation fails on unexpected errors
 
             if validated_ticker:
                 primary_ticker = validated_ticker
                 logging.info(f"Lookup success. Using primary ticker: {primary_ticker}")
                 # Inform the user if the name lookup found a ticker they didn't specify directly
                 is_query_like_ticker = bool(re.fullmatch(r'[\$\.A-Z0-9\-]{1,10}', lookup_query.upper().replace('$','')))
-                if not is_query_like_ticker and lookup_query.upper() != primary_ticker.upper() and lookup_query.lower() != primary_ticker.lower():
+                # Only show toast if the query wasn't already a perfect or near-perfect match for the found ticker
+                if not is_query_like_ticker and lookup_query.upper().replace('$','') != primary_ticker.upper():
                      st.toast(f"Found data for **{primary_ticker}** (based on '{lookup_query}')", icon="💡")
             else:
                 logging.info(f"Could not validate/find equity/ETF ticker for '{lookup_query}'.")
@@ -2363,8 +2256,9 @@ if user_input_triggered:
             with st.spinner(f"Gathering data & insights for **{primary_ticker}**..."):
                 logging.info(f"--- Processing Data for Ticker: {primary_ticker} ---")
 
-                # 1. Fetch Yahoo Summary Data
+                # 1. Fetch Yahoo Summary Data (Uses retry-decorated function internally)
                 placeholder.markdown(f"⏳ Fetching Yahoo Finance summary for **{primary_ticker}**...")
+                # get_stock_data now calls get_stock_data_yf_retry internally and handles its errors
                 stock_data = get_stock_data(primary_ticker)
                 if stock_data:
                      stock_data_for_prompt = format_stock_data_for_prompt(stock_data)
@@ -2374,9 +2268,9 @@ if user_input_triggered:
                      logging.warning(f"Yahoo summary fetch failed for {primary_ticker}.")
 
 
-                # 2. Fetch Unified Yahoo History (Needed for Risk & ETS)
+                # 2. Fetch Unified Yahoo History (Needed for Risk & ETS) (Uses retry-decorated function internally)
                 placeholder.markdown(f"⏳ Fetching Yahoo Finance history (for Risk/ETS) for **{primary_ticker}**...")
-                # Fetch 3 years of history (needed for some potential factors and ETS)
+                # get_unified_yfinance_history now calls get_unified_yfinance_history_retry internally and handles its errors
                 close_prices_history_yf, full_history_df_yf = get_unified_yfinance_history(primary_ticker, period="3y")
                 if full_history_df_yf is None or full_history_df_yf.empty:
                      logging.warning(f"Unified Yahoo history fetch failed or empty for {primary_ticker}. Risk & ETS might be unavailable.")
@@ -2388,12 +2282,9 @@ if user_input_triggered:
                 placeholder.markdown(f"⏳ Calculating Dynamic Risk Score for **{primary_ticker}**...")
                 intermediate_risk_scores = {}; factors_weight_sum = 0.0
                 # Pass both history df and info dict to the simplified risk score function
-                if full_history_df_yf is not None and not full_history_df_yf.empty and stock_data is not None:
-                    try:
-                         risk_score_final, intermediate_risk_scores, factors_weight_sum = calculate_dynamic_risk_score(primary_ticker, full_history_df_yf, stock_data, weights=DEFAULT_WEIGHTS)
-                    except Exception as risk_err:
-                         logging.error(f"Error calling simplified risk calc for {primary_ticker}: {risk_err}", exc_info=True)
-                         risk_score_final = None # Ensure score is None on error
+                # Risk score calculation now has internal checks for input data presence
+                risk_score_final, intermediate_risk_scores, factors_weight_sum = calculate_dynamic_risk_score(primary_ticker, full_history_df_yf, stock_data, weights=DEFAULT_WEIGHTS)
+
 
                 if risk_score_final is not None and pd.notna(risk_score_final): # Check for pd.notna here too
                     risk_category = get_risk_category(risk_score_final)
@@ -2404,7 +2295,8 @@ if user_input_triggered:
                     risk_category = "N/A"
                     logging.warning(f"Simplified risk score calc returned None/NaN for {primary_ticker} or input data invalid.")
                     # Show a toast if risk score failed specifically for this ticker
-                    st.toast(f"⚠️ Risk score unavailable for {primary_ticker}. Requires historical price data and basic info.", icon="⚠️")
+                    # Only show toast if the ticker was actually found/validated
+                    if primary_ticker: st.toast(f"⚠️ Risk score unavailable for {primary_ticker}. Requires historical price data and basic info.", icon="⚠️")
 
 
                 # 4. Fetch Polygon.io data and Calculate Trading Signals
