@@ -1917,9 +1917,9 @@ if "predefined_question" not in st.session_state: st.session_state.predefined_qu
 
 # --- UI Elements ---
 # Updated Title
-st.markdown('<h1 style="text-align: left;">📈 Financial Chat, Risk Score, News & Forecasting</h1>', unsafe_allow_html=True)
+
 # Updated description
-st.markdown(f'<p style="text-align: left; font-size: small;"><br>Ask about stocks ($AAPL, Microsoft), compare, or discuss finance. Includes Dynamic Risk Score, Recent News Sentiment (Multi-Source/{NEWS_DAYS_BACK}d/VADER), and ETS Price Forecasting (Calculated). No charts or technical scans.</p>', unsafe_allow_html=True)
+
 
 with st.sidebar:
     st.image("https://streamlit.io/images/brand/streamlit-mark-color.png", width=50)
